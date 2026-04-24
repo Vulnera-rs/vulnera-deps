@@ -6,7 +6,7 @@
 use globset::{Glob, GlobSetBuilder};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use vulnera_core::domain::vulnerability::value_objects::Ecosystem;
+use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
 
 /// Configuration for dependency analysis
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

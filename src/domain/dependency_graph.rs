@@ -4,8 +4,8 @@
 //! including nodes (packages), edges (dependencies), and graph algorithms.
 
 use std::collections::{HashMap, HashSet};
-use vulnera_core::domain::vulnerability::entities::Package;
-use vulnera_core::domain::vulnerability::value_objects::Version;
+use vulnera_contract::domain::vulnerability::entities::Package;
+use vulnera_contract::domain::vulnerability::value_objects::Version;
 
 use super::source_location::SourceLocation;
 use super::version_constraint::VersionConstraint;
@@ -353,7 +353,7 @@ impl Default for DependencyGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vulnera_core::domain::vulnerability::value_objects::Ecosystem;
+    use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
 
     fn create_test_package(name: &str, version: &str) -> Package {
         Package::new(

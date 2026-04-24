@@ -6,13 +6,14 @@ use std::sync::Arc;
 
 use tracing::debug;
 
-use vulnera_core::Config;
-use vulnera_core::application::errors::ApplicationError;
-use vulnera_core::domain::vulnerability::entities::{Package, Vulnerability};
-use vulnera_core::domain::vulnerability::repositories::IVulnerabilityRepository;
-use vulnera_core::domain::vulnerability::value_objects::Ecosystem;
-use vulnera_core::infrastructure::parsers::ParserFactory;
-use vulnera_core::infrastructure::repository_source::RepositorySourceClient;
+use crate::application::errors::ApplicationError;
+use vulnera_contract::Config;
+use vulnera_contract::domain::vulnerability::entities::{Package, Vulnerability};
+use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityRepository;
+use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
+
+use crate::parsers::ParserFactory;
+use vulnera_infrastructure::infrastructure::repository_source::RepositorySourceClient;
 
 /// Input for analyzing a repository (already validated & parsed from request/URL)
 #[derive(Debug, Clone)]
@@ -46,7 +47,7 @@ pub struct RepositoryAnalysisInternalResult {
     pub commit_sha: String,
     pub files: Vec<RepositoryFileResultInternal>,
     pub vulnerabilities: Vec<Vulnerability>,
-    pub severity_breakdown: vulnera_core::domain::vulnerability::entities::SeverityBreakdown,
+    pub severity_breakdown: vulnera_contract::domain::vulnerability::entities::SeverityBreakdown,
     pub total_files_scanned: u32,
     pub analyzed_files: u32,
     pub skipped_files: u32,
@@ -67,20 +68,17 @@ pub trait RepositoryAnalysisService: Send + Sync {
 }
 
 /// Repository analysis service implementation
-pub struct RepositoryAnalysisServiceImpl<
-    C: RepositorySourceClient,
-    R: IVulnerabilityRepository + 'static,
-> {
+pub struct RepositoryAnalysisServiceImpl<C: RepositorySourceClient> {
     source_client: Arc<C>,
-    vuln_repo: Arc<R>,
+    vuln_repo: Option<Arc<dyn IVulnerabilityRepository>>,
     parser_factory: Arc<ParserFactory>,
     config: Arc<Config>,
 }
 
-impl<C: RepositorySourceClient, R: IVulnerabilityRepository> RepositoryAnalysisServiceImpl<C, R> {
+impl<C: RepositorySourceClient> RepositoryAnalysisServiceImpl<C> {
     pub fn new(
         source_client: Arc<C>,
-        vuln_repo: Arc<R>,
+        vuln_repo: Option<Arc<dyn IVulnerabilityRepository>>,
         parser_factory: Arc<ParserFactory>,
         config: Arc<Config>,
     ) -> Self {
@@ -94,10 +92,8 @@ impl<C: RepositorySourceClient, R: IVulnerabilityRepository> RepositoryAnalysisS
 }
 
 #[async_trait]
-impl<C, R> RepositoryAnalysisService for RepositoryAnalysisServiceImpl<C, R>
-where
-    C: RepositorySourceClient + 'static,
-    R: IVulnerabilityRepository + 'static,
+impl<C: RepositorySourceClient + 'static> RepositoryAnalysisService
+    for RepositoryAnalysisServiceImpl<C>
 {
     #[tracing::instrument(skip(self, input))]
     async fn analyze_repository(
@@ -119,21 +115,21 @@ where
             )
             .await
             .map_err(|e| match e {
-                vulnera_core::infrastructure::repository_source::RepositorySourceError::NotFound(_)
-                | vulnera_core::infrastructure::repository_source::RepositorySourceError::AccessDenied(
+                vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::NotFound(_)
+                | vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::AccessDenied(
                     _,
                 ) => ApplicationError::NotFound {
                     resource: "repository".to_string(),
                     id: format!("{}/{}", &input.owner, &input.repo),
                 },
-                vulnera_core::infrastructure::repository_source::RepositorySourceError::RateLimited {
+                vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::RateLimited {
                     message,
                     ..
                 } => ApplicationError::RateLimited { message },
-                vulnera_core::infrastructure::repository_source::RepositorySourceError::Validation(
+                vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::Validation(
                     msg,
                 ) => ApplicationError::Domain(
-                    vulnera_core::domain::vulnerability::errors::VulnerabilityDomainError::InvalidInput {
+                    vulnera_contract::domain::vulnerability::errors::VulnerabilityDomainError::InvalidInput {
                         field: "ref".into(),
                         message: msg,
                     },
@@ -194,22 +190,22 @@ where
                 )
                 .await
                 .map_err(|e| match e {
-                    vulnera_core::infrastructure::repository_source::RepositorySourceError::RateLimited {
+                    vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::RateLimited {
                         ..
                     } => ApplicationError::RateLimited {
                         message: e.to_string(),
                     },
-                    vulnera_core::infrastructure::repository_source::RepositorySourceError::NotFound(_)
-                    | vulnera_core::infrastructure::repository_source::RepositorySourceError::AccessDenied(
+                    vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::NotFound(_)
+                    | vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::AccessDenied(
                         _,
                     ) => ApplicationError::NotFound {
                         resource: "file contents".into(),
                         id: format!("{}/{}", &input.owner, &input.repo),
                     },
-                    vulnera_core::infrastructure::repository_source::RepositorySourceError::Validation(
+                    vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::Validation(
                         msg,
                     ) => ApplicationError::Domain(
-                        vulnera_core::domain::vulnerability::errors::VulnerabilityDomainError::InvalidInput {
+                        vulnera_contract::domain::vulnerability::errors::VulnerabilityDomainError::InvalidInput {
                             field: "ref".into(),
                             message: msg,
                         },
@@ -278,28 +274,30 @@ where
 
         // Vulnerability lookup
         let mut all_vulns: Vec<Vulnerability> = Vec::new();
-        for pkg in unique_packages.values() {
-            match self.vuln_repo.find_vulnerabilities(pkg).await {
-                Ok(mut v) => {
-                    let before = v.len();
-                    v.retain(|vv| vv.affects_package(pkg));
-                    let after = v.len();
-                    debug!(
-                        "filtered repository vulnerabilities by version: package={} total={} affecting={}",
-                        pkg.identifier(),
-                        before,
-                        after
-                    );
-                    all_vulns.append(&mut v)
+        if let Some(vuln_repo) = &self.vuln_repo {
+            for pkg in unique_packages.values() {
+                match vuln_repo.find_vulnerabilities(pkg).await {
+                    Ok(mut v) => {
+                        let before = v.len();
+                        v.retain(|vv| vv.affects_package(pkg));
+                        let after = v.len();
+                        debug!(
+                            "filtered repository vulnerabilities by version: package={} total={} affecting={}",
+                            pkg.identifier(),
+                            before,
+                            after
+                        );
+                        all_vulns.append(&mut v)
+                    }
+                    Err(e) => debug!("vuln lookup failed for package {}: {}", pkg.identifier(), e),
                 }
-                Err(e) => debug!("vuln lookup failed for package {}: {}", pkg.identifier(), e),
             }
         }
         // Deduplicate vulnerabilities by id
         let mut seen = HashSet::new();
         all_vulns.retain(|v| seen.insert(v.id.as_str().to_string()));
         let severity_breakdown =
-            vulnera_core::domain::vulnerability::entities::SeverityBreakdown::from_vulnerabilities(
+            vulnera_contract::domain::vulnerability::entities::SeverityBreakdown::from_vulnerabilities(
                 &all_vulns,
             );
 

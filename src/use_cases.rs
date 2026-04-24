@@ -5,15 +5,18 @@ use std::time::Instant;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
-use vulnera_core::application::errors::ApplicationError;
-use vulnera_core::application::vulnerability::services::CacheService;
-use vulnera_core::domain::vulnerability::{
+use crate::application::errors::ApplicationError;
+use vulnera_contract::domain::vulnerability::{
     entities::{AnalysisReport, Package, Vulnerability},
     repositories::IVulnerabilityRepository,
     value_objects::{Ecosystem, VulnerabilityId},
 };
-use vulnera_core::infrastructure::parsers::ParserFactory;
-use vulnera_core::infrastructure::registries::{PackageRegistryClient, VulneraRegistryAdapter};
+use vulnera_infrastructure::application::vulnerability::services::CacheService;
+
+use crate::parsers::{ParseResult, ParserFactory};
+use vulnera_infrastructure::infrastructure::registries::{
+    PackageRegistryClient, VulneraRegistryAdapter,
+};
 
 use crate::application::analysis_context::{AnalysisContext, detect_workspace};
 use crate::domain::{DependencyGraph, PackageId};
@@ -29,7 +32,7 @@ use std::path::PathBuf;
 /// Use case for analyzing dependencies from a file
 pub struct AnalyzeDependenciesUseCase<C: CacheService + 'static> {
     parser_factory: Arc<ParserFactory>,
-    vulnerability_repository: Arc<dyn IVulnerabilityRepository>,
+    vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
     cache_service: Arc<C>,
     max_concurrent_requests: usize,
     max_concurrent_registry_queries: usize,
@@ -42,7 +45,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
     /// Create a new use case instance
     pub fn new(
         parser_factory: Arc<ParserFactory>,
-        vulnerability_repository: Arc<dyn IVulnerabilityRepository>,
+        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
         cache_service: Arc<C>,
         max_concurrent_requests: usize,
     ) -> Self {
@@ -69,7 +72,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
     /// Create a new use case instance with full configuration
     pub fn new_with_config(
         parser_factory: Arc<ParserFactory>,
-        vulnerability_repository: Arc<dyn IVulnerabilityRepository>,
+        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
         cache_service: Arc<C>,
         max_concurrent_requests: usize,
         max_concurrent_registry_queries: usize,
@@ -97,7 +100,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
     /// Create a new use case instance with analysis context
     pub fn new_with_context(
         parser_factory: Arc<ParserFactory>,
-        vulnerability_repository: Arc<dyn IVulnerabilityRepository>,
+        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
         cache_service: Arc<C>,
         max_concurrent_requests: usize,
         max_concurrent_registry_queries: usize,
@@ -325,7 +328,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                     Result<
                         (
                             usize,
-                            Option<vulnera_core::domain::vulnerability::value_objects::Version>,
+                            Option<vulnera_contract::domain::vulnerability::value_objects::Version>,
                         ),
                         ApplicationError,
                     >,
@@ -335,19 +338,19 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                     let pkg_name = pkg.name.clone();
                     let lower = pkg.version.clone();
                     let upper = if lower.0.major > 0 {
-                        vulnera_core::domain::vulnerability::value_objects::Version::new(
+                        vulnera_contract::domain::vulnerability::value_objects::Version::new(
                             lower.0.major + 1,
                             0,
                             0,
                         )
                     } else if lower.0.minor > 0 {
-                        vulnera_core::domain::vulnerability::value_objects::Version::new(
+                        vulnera_contract::domain::vulnerability::value_objects::Version::new(
                             0,
                             lower.0.minor + 1,
                             0,
                         )
                     } else {
-                        vulnera_core::domain::vulnerability::value_objects::Version::new(
+                        vulnera_contract::domain::vulnerability::value_objects::Version::new(
                             0,
                             0,
                             lower.0.patch + 1,
@@ -358,8 +361,8 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                     join_set.spawn(async move {
                         let _permit = permit.acquire().await.map_err(|e| {
                             ApplicationError::Vulnerability(
-                                vulnera_core::application::errors::VulnerabilityError::Api(
-                                    vulnera_core::application::errors::ApiError::Http {
+                                vulnera_infrastructure::application::errors::VulnerabilityError::Api(
+                                    vulnera_infrastructure::application::errors::ApiError::Http {
                                         status: 500,
                                         message: format!("Failed to acquire semaphore: {}", e),
                                     },
@@ -554,7 +557,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
         file_content: &str,
         ecosystem: Ecosystem,
         filename: Option<&str>,
-    ) -> Result<vulnera_core::infrastructure::parsers::ParseResult, ApplicationError> {
+    ) -> Result<ParseResult, ApplicationError> {
         // Try to find a parser based on filename first
         if let Some(filename) = filename
             && let Some(parser) = self.parser_factory.create_parser(filename)
@@ -636,7 +639,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                             let package_id = package_arc.identifier();
 
                             // Use optimized cache key generation
-                            let cache_key = vulnera_core::infrastructure::cache::CacheServiceImpl::package_vulnerabilities_key(&package_arc);
+                            let cache_key = vulnera_infrastructure::infrastructure::cache::CacheServiceImpl::package_vulnerabilities_key(&package_arc);
 
                             // Check cache first
                             if let Ok(Some(cached_vulns)) =
@@ -652,7 +655,11 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                                 return Ok((package_id, filtered));
                             }
 
-                            // Cache miss - query repository
+                            // Cache miss - query repository if available
+                            let Some(vuln_repo) = vuln_repo else {
+                                return Ok((package_id, vec![]));
+                            };
+
                             debug!(
                                 "Cache miss for package: {}, querying repository",
                                 package_id
@@ -730,10 +737,10 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
         graph: &DependencyGraph,
         ecosystem: Ecosystem,
     ) -> Result<
-        HashMap<PackageId, Vec<vulnera_core::domain::vulnerability::value_objects::Version>>,
+        HashMap<PackageId, Vec<vulnera_contract::domain::vulnerability::value_objects::Version>>,
         ApplicationError,
     > {
-        use vulnera_core::infrastructure::registries::VulneraRegistryAdapter;
+        use vulnera_infrastructure::infrastructure::registries::VulneraRegistryAdapter;
 
         let registry: Arc<dyn PackageRegistryClient> = Arc::new(VulneraRegistryAdapter::new());
 
@@ -745,7 +752,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
             Result<
                 (
                     PackageId,
-                    Vec<vulnera_core::domain::vulnerability::value_objects::Version>,
+                    Vec<vulnera_contract::domain::vulnerability::value_objects::Version>,
                 ),
                 ApplicationError,
             >,
@@ -762,8 +769,8 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
             join_set.spawn(async move {
                 let _permit = permit.acquire().await.map_err(|e| {
                     ApplicationError::Vulnerability(
-                        vulnera_core::application::errors::VulnerabilityError::Api(
-                            vulnera_core::application::errors::ApiError::Http {
+                        vulnera_infrastructure::application::errors::VulnerabilityError::Api(
+                            vulnera_infrastructure::application::errors::ApiError::Http {
                                 status: 500,
                                 message: format!("Failed to acquire semaphore: {}", e),
                             },
@@ -777,7 +784,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                 {
                     Ok(version_infos) => {
                         let versions: Vec<
-                            vulnera_core::domain::vulnerability::value_objects::Version,
+                            vulnera_contract::domain::vulnerability::value_objects::Version,
                         > = version_infos.into_iter().map(|vi| vi.version).collect();
                         Ok((package_id_clone, versions))
                     }
@@ -815,14 +822,14 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
 
 /// Use case for getting vulnerability details by ID
 pub struct GetVulnerabilityDetailsUseCase<C: CacheService> {
-    vulnerability_repository: Arc<dyn IVulnerabilityRepository>,
+    vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
     cache_service: Arc<C>,
 }
 
 impl<C: CacheService + 'static> GetVulnerabilityDetailsUseCase<C> {
     /// Create a new use case instance
     pub fn new(
-        vulnerability_repository: Arc<dyn IVulnerabilityRepository>,
+        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
         cache_service: Arc<C>,
     ) -> Self {
         Self {
@@ -852,11 +859,15 @@ impl<C: CacheService + 'static> GetVulnerabilityDetailsUseCase<C> {
         );
 
         // Query repository
-        let vulnerability = self
-            .vulnerability_repository
+        let Some(vuln_repo) = &self.vulnerability_repository else {
+            return Err(ApplicationError::NotFound {
+                resource: "vulnerability".to_string(),
+                id: vulnerability_id.as_str().to_string(),
+            });
+        };
+        let vulnerability = vuln_repo
             .get_vulnerability_by_id(vulnerability_id)
-            .await
-            .map_err(ApplicationError::Vulnerability)?
+            .await?
             .ok_or_else(|| ApplicationError::NotFound {
                 resource: "vulnerability".to_string(),
                 id: vulnerability_id.as_str().to_string(),

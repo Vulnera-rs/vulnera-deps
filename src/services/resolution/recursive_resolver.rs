@@ -4,11 +4,13 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use vulnera_core::application::errors::{ApplicationError, VulnerabilityError};
-use vulnera_core::application::vulnerability::services::CacheService;
-use vulnera_core::domain::vulnerability::entities::Package;
-use vulnera_core::domain::vulnerability::value_objects::{Ecosystem, Version};
-use vulnera_core::infrastructure::registries::{PackageRegistryClient, RegistryPackageMetadata};
+use crate::application::errors::{ApplicationError, VulnerabilityError};
+use vulnera_contract::domain::vulnerability::entities::Package;
+use vulnera_contract::domain::vulnerability::value_objects::{Ecosystem, Version};
+use vulnera_infrastructure::application::vulnerability::services::CacheService;
+use vulnera_infrastructure::infrastructure::registries::{
+    PackageRegistryClient, RegistryPackageMetadata,
+};
 
 use crate::domain::version_constraint::VersionConstraint;
 use crate::domain::{DependencyEdge, DependencyGraph, PackageId, PackageMetadata, PackageNode};

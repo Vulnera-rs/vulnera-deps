@@ -3,15 +3,18 @@
 //! This module provides services for resolving transitive dependencies
 //! and building complete dependency graphs from manifest and lockfiles.
 
+use crate::application::errors::ApplicationError;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tracing::{debug, warn};
-use vulnera_core::application::errors::ApplicationError;
-use vulnera_core::domain::vulnerability::entities::Package;
-use vulnera_core::domain::vulnerability::value_objects::Ecosystem;
-use vulnera_core::infrastructure::parsers::ParserFactory;
-use vulnera_core::infrastructure::registries::{PackageRegistryClient, RegistryError, VersionInfo};
+use vulnera_contract::domain::vulnerability::entities::Package;
+use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
+
+use crate::parsers::ParserFactory;
+use vulnera_infrastructure::infrastructure::registries::{
+    PackageRegistryClient, RegistryError, VersionInfo,
+};
 
 use crate::domain::{
     DependencyEdge, DependencyGraph, PackageId, PackageMetadata, PackageNode,
@@ -25,7 +28,7 @@ pub trait DependencyResolverService: Send + Sync {
     async fn build_graph(
         &self,
         packages: Vec<Package>,
-        dependencies: Vec<vulnera_core::domain::vulnerability::entities::Dependency>,
+        dependencies: Vec<vulnera_contract::domain::vulnerability::entities::Dependency>,
         ecosystem: Ecosystem,
     ) -> Result<DependencyGraph, ApplicationError>;
 
@@ -82,7 +85,7 @@ impl DependencyResolverServiceImpl {
     fn select_best_version(
         versions: Vec<VersionInfo>,
         requirement: &str,
-    ) -> Option<vulnera_core::domain::vulnerability::value_objects::Version> {
+    ) -> Option<vulnera_contract::domain::vulnerability::value_objects::Version> {
         let constraint = VersionConstraint::parse(requirement).unwrap_or(VersionConstraint::Any);
 
         versions
@@ -98,7 +101,7 @@ impl DependencyResolverService for DependencyResolverServiceImpl {
     async fn build_graph(
         &self,
         packages: Vec<Package>,
-        dependencies: Vec<vulnera_core::domain::vulnerability::entities::Dependency>,
+        dependencies: Vec<vulnera_contract::domain::vulnerability::entities::Dependency>,
         _ecosystem: Ecosystem,
     ) -> Result<DependencyGraph, ApplicationError> {
         let mut graph = DependencyGraph::new();
@@ -418,8 +421,8 @@ pub async fn build_graph_from_manifest(
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use vulnera_core::domain::vulnerability::value_objects::Version;
-    use vulnera_core::infrastructure::registries::{
+    use vulnera_contract::domain::vulnerability::value_objects::Version;
+    use vulnera_infrastructure::infrastructure::registries::{
         RegistryDependency, RegistryPackageMetadata, VersionInfo,
     };
 
@@ -509,7 +512,7 @@ mod tests {
         let packages = vec![
             Package::new(
                 "express".to_string(),
-                vulnera_core::domain::vulnerability::value_objects::Version::parse("4.17.1")
+                vulnera_contract::domain::vulnerability::value_objects::Version::parse("4.17.1")
                     .unwrap(),
                 Ecosystem::Npm,
             )

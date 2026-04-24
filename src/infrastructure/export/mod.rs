@@ -8,7 +8,7 @@ use tokio::fs;
 use tracing::{debug, info};
 
 use crate::domain::DependencyGraph;
-use vulnera_core::application::errors::ApplicationError;
+use crate::application::errors::ApplicationError;
 
 /// Exporter for dependency graphs supporting multiple formats
 pub struct GraphExporter;

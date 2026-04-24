@@ -2,11 +2,13 @@
 
 use async_trait::async_trait;
 
+use crate::application::errors::ApplicationError;
+
 /// Compute semantic upgrade impact between current and target versions.
 /// Returns Major/Minor/Patch when target is higher than current on that axis, Unknown otherwise.
 pub fn compute_upgrade_impact(
-    current: &vulnera_core::domain::vulnerability::value_objects::Version,
-    target: &vulnera_core::domain::vulnerability::value_objects::Version,
+    current: &vulnera_contract::domain::vulnerability::value_objects::Version,
+    target: &vulnera_contract::domain::vulnerability::value_objects::Version,
 ) -> UpgradeImpact {
     let c = &current.0;
     let t = &target.0;
@@ -36,12 +38,13 @@ pub enum UpgradeImpact {
 pub struct VersionRecommendation {
     /// Minimal safe version >= current (if current known)
     pub nearest_safe_above_current:
-        Option<vulnera_core::domain::vulnerability::value_objects::Version>,
+        Option<vulnera_contract::domain::vulnerability::value_objects::Version>,
     /// Newest safe version available (may equal nearest)
-    pub most_up_to_date_safe: Option<vulnera_core::domain::vulnerability::value_objects::Version>,
+    pub most_up_to_date_safe:
+        Option<vulnera_contract::domain::vulnerability::value_objects::Version>,
     /// Next safe version within the current major (minor bump or patch), if available
     pub next_safe_minor_within_current_major:
-        Option<vulnera_core::domain::vulnerability::value_objects::Version>,
+        Option<vulnera_contract::domain::vulnerability::value_objects::Version>,
     /// Classification of the nearest upgrade impact (major/minor/patch/unknown)
     pub nearest_impact: Option<UpgradeImpact>,
     /// Classification of the most up-to-date upgrade impact (major/minor/patch/unknown)
@@ -58,9 +61,9 @@ pub struct VersionRecommendation {
 pub trait VersionResolutionService: Send + Sync {
     async fn recommend(
         &self,
-        ecosystem: vulnera_core::domain::vulnerability::value_objects::Ecosystem,
+        ecosystem: vulnera_contract::domain::vulnerability::value_objects::Ecosystem,
         name: &str,
-        current: Option<vulnera_core::domain::vulnerability::value_objects::Version>,
-        vulnerabilities: &[vulnera_core::domain::vulnerability::entities::Vulnerability],
-    ) -> Result<VersionRecommendation, vulnera_core::application::errors::ApplicationError>;
+        current: Option<vulnera_contract::domain::vulnerability::value_objects::Version>,
+        vulnerabilities: &[vulnera_contract::domain::vulnerability::entities::Vulnerability],
+    ) -> Result<VersionRecommendation, ApplicationError>;
 }

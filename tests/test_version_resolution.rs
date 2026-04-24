@@ -1,7 +1,7 @@
 //! Integration tests for version resolution algorithms
 
 use std::collections::HashMap;
-use vulnera_core::domain::vulnerability::value_objects::{Ecosystem, Version};
+use vulnera_contract::domain::vulnerability::value_objects::{Ecosystem, Version};
 use vulnera_deps::domain::{
     DependencyEdge, DependencyGraph, PackageId, PackageNode, VersionConstraint,
 };
@@ -78,7 +78,7 @@ fn test_lexicographic_optimizer_minimal_upgrade() {
 #[test]
 fn test_backtracking_resolver_basic() {
     let mut graph = DependencyGraph::new();
-    let pkg_a = vulnera_core::domain::vulnerability::entities::Package::new(
+    let pkg_a = vulnera_contract::domain::vulnerability::entities::Package::new(
         "a".to_string(),
         create_version("1.0.0"),
         Ecosystem::Npm,
@@ -104,7 +104,7 @@ fn test_backtracking_resolver_basic() {
 #[test]
 fn test_backtracking_resolver_conflict() {
     let mut graph = DependencyGraph::new();
-    let pkg_a = vulnera_core::domain::vulnerability::entities::Package::new(
+    let pkg_a = vulnera_contract::domain::vulnerability::entities::Package::new(
         "a".to_string(),
         create_version("1.0.0"),
         Ecosystem::Npm,
@@ -128,13 +128,13 @@ fn test_backtracking_resolver_conflict() {
 fn test_backtracking_resolver_with_dependencies() {
     // A -> B
     let mut graph = DependencyGraph::new();
-    let pkg_a = vulnera_core::domain::vulnerability::entities::Package::new(
+    let pkg_a = vulnera_contract::domain::vulnerability::entities::Package::new(
         "a".to_string(),
         create_version("1.0.0"),
         Ecosystem::Npm,
     )
     .unwrap();
-    let pkg_b = vulnera_core::domain::vulnerability::entities::Package::new(
+    let pkg_b = vulnera_contract::domain::vulnerability::entities::Package::new(
         "b".to_string(),
         create_version("1.0.0"),
         Ecosystem::Npm,

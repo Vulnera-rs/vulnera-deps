@@ -5,11 +5,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use vulnera_core::domain::vulnerability::repositories::IVulnerabilityRepository;
-use vulnera_core::infrastructure::cache::CacheServiceImpl;
-use vulnera_core::infrastructure::parsers::ParserFactory;
+use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityRepository;
+use vulnera_infrastructure::infrastructure::cache::CacheServiceImpl;
 
-use vulnera_core::domain::module::{
+use crate::parsers::ParserFactory;
+
+use vulnera_contract::domain::module::{
     AnalysisModule, Finding, FindingConfidence, FindingSeverity, FindingType, Location,
     ModuleConfig, ModuleExecutionError, ModuleResult, ModuleResultMetadata, ModuleType,
     VulnerabilityFindingMetadata,
@@ -26,7 +27,7 @@ pub struct DependencyAnalyzerModule {
 impl DependencyAnalyzerModule {
     pub fn new(
         parser_factory: Arc<ParserFactory>,
-        vulnerability_repository: Arc<dyn IVulnerabilityRepository>,
+        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
         cache_service: Arc<CacheServiceImpl>,
         max_concurrent_requests: usize,
         max_concurrent_registry_queries: usize,
@@ -48,7 +49,7 @@ impl DependencyAnalyzerModule {
     /// Create a new module with analysis context for workspace-aware analysis
     pub fn new_with_context(
         parser_factory: Arc<ParserFactory>,
-        vulnerability_repository: Arc<dyn IVulnerabilityRepository>,
+        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
         cache_service: Arc<CacheServiceImpl>,
         max_concurrent_requests: usize,
         max_concurrent_registry_queries: usize,
@@ -78,7 +79,7 @@ impl AnalysisModule for DependencyAnalyzerModule {
 
     async fn prepare_config(
         &self,
-        project: &vulnera_core::domain::project::Project,
+        project: &vulnera_contract::domain::project::Project,
     ) -> Result<std::collections::HashMap<String, serde_json::Value>, ModuleExecutionError> {
         let mut config_map = std::collections::HashMap::new();
 
@@ -178,8 +179,10 @@ impl AnalysisModule for DependencyAnalyzerModule {
         };
 
         let ecosystem =
-            vulnera_core::domain::vulnerability::value_objects::Ecosystem::from_str(ecosystem_str)
-                .map_err(ModuleExecutionError::InvalidConfig)?;
+            vulnera_contract::domain::vulnerability::value_objects::Ecosystem::from_str(
+                ecosystem_str,
+            )
+            .map_err(ModuleExecutionError::InvalidConfig)?;
 
         let filename = config.config.get("filename").and_then(|v| v.as_str());
 
@@ -222,18 +225,19 @@ impl AnalysisModule for DependencyAnalyzerModule {
                         end_column: None,
                     },
                     severity: match vuln.severity {
-                        vulnera_core::domain::vulnerability::value_objects::Severity::Critical => {
+                        vulnera_contract::domain::vulnerability::value_objects::Severity::Critical => {
                             FindingSeverity::Critical
                         }
-                        vulnera_core::domain::vulnerability::value_objects::Severity::High => {
+                        vulnera_contract::domain::vulnerability::value_objects::Severity::High => {
                             FindingSeverity::High
                         }
-                        vulnera_core::domain::vulnerability::value_objects::Severity::Medium => {
+                        vulnera_contract::domain::vulnerability::value_objects::Severity::Medium => {
                             FindingSeverity::Medium
                         }
-                        vulnera_core::domain::vulnerability::value_objects::Severity::Low => {
+                        vulnera_contract::domain::vulnerability::value_objects::Severity::Low => {
                             FindingSeverity::Low
                         }
+                        _ => FindingSeverity::Info,
                     },
                     confidence: FindingConfidence::High,
                     description: vuln.description.clone(),

@@ -27,7 +27,7 @@
 //!
 //! ```rust,ignore
 //! use vulnera_deps::DependencyModule;
-//! use vulnera_core::config::DependencyConfig;
+//! use vulnera_contract::config::DependencyConfig;
 //!
 //! let module = DependencyModule::new(config, osv_client, nvd_client, ghsa_client);
 //! let results = module.analyze(input).await?;
@@ -47,6 +47,7 @@
 pub mod application;
 pub mod domain;
 pub mod module;
+pub mod parsers;
 pub mod services;
 pub mod types;
 pub mod use_cases;
@@ -54,6 +55,7 @@ pub mod use_cases;
 pub use application::*;
 pub use domain::*;
 pub use module::*;
+pub use parsers::*;
 pub use services::*;
 pub use types::*;
 pub use use_cases::*;

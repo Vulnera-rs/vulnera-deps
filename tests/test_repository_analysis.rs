@@ -1,18 +1,19 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use vulnera_core::Config;
-use vulnera_core::application::errors::{ApplicationError, VulnerabilityError};
-use vulnera_core::domain::vulnerability::entities::{Package, Vulnerability};
-use vulnera_core::domain::vulnerability::repositories::IVulnerabilityRepository;
-use vulnera_core::domain::vulnerability::value_objects::VulnerabilityId;
-use vulnera_core::infrastructure::parsers::ParserFactory;
-use vulnera_core::infrastructure::repository_source::{
-    FetchedFileContent, RepositoryFile, RepositorySourceClient, RepositorySourceError,
-    RepositorySourceResult,
-};
+use vulnera_contract::Config;
+use vulnera_contract::VulnerabilityError;
+use vulnera_contract::domain::vulnerability::entities::{Package, Vulnerability};
+use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityRepository;
+use vulnera_contract::domain::vulnerability::value_objects::VulnerabilityId;
+use vulnera_deps::ParserFactory;
 use vulnera_deps::services::repository_analysis::{
     RepositoryAnalysisInput, RepositoryAnalysisService, RepositoryAnalysisServiceImpl,
+};
+use vulnera_infrastructure::application::errors::ApplicationError;
+use vulnera_infrastructure::infrastructure::repository_source::{
+    FetchedFileContent, RepositoryFile, RepositorySourceClient, RepositorySourceError,
+    RepositorySourceResult,
 };
 
 // --- Mocks ---
@@ -186,7 +187,7 @@ async fn test_analyze_repository_success() {
 
     let service = RepositoryAnalysisServiceImpl::new(
         Arc::new(mock_client),
-        mock_vuln_repo,
+        Some(mock_vuln_repo),
         parser_factory,
         config,
     );
@@ -227,7 +228,7 @@ async fn test_analyze_repository_rate_limit() {
 
     let service = RepositoryAnalysisServiceImpl::new(
         Arc::new(mock_client),
-        mock_vuln_repo,
+        Some(mock_vuln_repo),
         parser_factory,
         config,
     );
@@ -278,7 +279,7 @@ async fn test_analyze_repository_file_size_limit() {
 
     let service = RepositoryAnalysisServiceImpl::new(
         Arc::new(mock_client),
-        mock_vuln_repo,
+        Some(mock_vuln_repo),
         parser_factory,
         Arc::new(config),
     );
@@ -327,7 +328,7 @@ async fn test_analyze_repository_max_files_truncation() {
 
     let service = RepositoryAnalysisServiceImpl::new(
         Arc::new(mock_client),
-        mock_vuln_repo,
+        Some(mock_vuln_repo),
         parser_factory,
         config,
     );
@@ -409,7 +410,7 @@ async fn test_analyze_repository_excludes_lockfiles_when_disabled() {
 
     let service = RepositoryAnalysisServiceImpl::new(
         Arc::new(mock_client),
-        mock_vuln_repo,
+        Some(mock_vuln_repo),
         parser_factory,
         config,
     );

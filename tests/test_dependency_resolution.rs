@@ -1,8 +1,8 @@
 //! Integration tests for dependency resolution
 
 use std::sync::Arc;
-use vulnera_core::domain::vulnerability::value_objects::Ecosystem;
-use vulnera_core::infrastructure::parsers::ParserFactory;
+use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
+use vulnera_deps::ParserFactory;
 use vulnera_deps::services::dependency_resolver::{
     DependencyResolverServiceImpl, build_graph_from_lockfile, build_graph_from_manifest,
 };
@@ -165,9 +165,9 @@ async fn test_transitive_resolution_stub() {
     let parser_factory = Arc::new(ParserFactory::new());
     let _resolver = DependencyResolverServiceImpl::new(parser_factory);
 
-    let package = vulnera_core::domain::vulnerability::entities::Package::new(
+    let package = vulnera_contract::domain::vulnerability::entities::Package::new(
         "express".to_string(),
-        vulnera_core::domain::vulnerability::value_objects::Version::parse("4.17.1").unwrap(),
+        vulnera_contract::domain::vulnerability::value_objects::Version::parse("4.17.1").unwrap(),
         Ecosystem::Npm,
     )
     .unwrap();

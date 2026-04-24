@@ -4,7 +4,7 @@
 //! including constraint satisfaction and conflict resolution.
 
 use std::collections::HashMap;
-use vulnera_core::domain::vulnerability::value_objects::Version;
+use vulnera_contract::domain::vulnerability::value_objects::Version;
 
 use crate::domain::{DependencyGraph, PackageId, VersionConstraint};
 
@@ -333,8 +333,8 @@ impl LexicographicOptimizer {
 mod tests {
     use super::*;
     use crate::domain::{DependencyEdge, DependencyGraph, PackageNode};
-    use vulnera_core::domain::vulnerability::entities::Package;
-    use vulnera_core::domain::vulnerability::value_objects::Ecosystem;
+    use vulnera_contract::domain::vulnerability::entities::Package;
+    use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
 
     fn test_package(name: &str, version: &str) -> Package {
         Package::new(

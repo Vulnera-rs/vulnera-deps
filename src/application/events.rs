@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use vulnera_core::domain::vulnerability::entities::{Package, Vulnerability};
+use vulnera_contract::domain::vulnerability::entities::{Package, Vulnerability};
 
 use crate::domain::{PackageId, SourceLocation};
 
@@ -166,8 +166,9 @@ mod tests {
         let emitter = VecEventEmitter::new();
         let package = Package::new(
             "test".to_string(),
-            vulnera_core::domain::vulnerability::value_objects::Version::parse("1.0.0").unwrap(),
-            vulnera_core::domain::vulnerability::value_objects::Ecosystem::Npm,
+            vulnera_contract::domain::vulnerability::value_objects::Version::parse("1.0.0")
+                .unwrap(),
+            vulnera_contract::domain::vulnerability::value_objects::Ecosystem::Npm,
         )
         .unwrap();
 

@@ -5,15 +5,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vulnera_core::application::errors::{ApplicationError, CacheError, VulnerabilityError};
-use vulnera_core::application::vulnerability::services::CacheService;
-use vulnera_core::domain::vulnerability::entities::{AffectedPackage, Package, Vulnerability};
-use vulnera_core::domain::vulnerability::repositories::IVulnerabilityRepository;
-use vulnera_core::domain::vulnerability::value_objects::{
+use vulnera_contract::VulnerabilityError;
+use vulnera_contract::domain::vulnerability::entities::{AffectedPackage, Package, Vulnerability};
+use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityRepository;
+use vulnera_contract::domain::vulnerability::value_objects::{
     Ecosystem, Severity, Version, VersionRange, VulnerabilityId,
 };
-use vulnera_core::infrastructure::parsers::ParserFactory;
+use vulnera_deps::ParserFactory;
 use vulnera_deps::use_cases::AnalyzeDependenciesUseCase;
+use vulnera_infrastructure::application::errors::{ApplicationError, CacheError};
+use vulnera_infrastructure::application::vulnerability::services::CacheService;
 
 // --- Mocks ---
 
@@ -140,13 +141,15 @@ async fn test_analyze_dependencies_success() {
         severity: Severity::High,
         affected_packages: vec![affected_pkg],
         published_at: chrono::Utc::now(),
-        sources: vec![vulnera_core::domain::vulnerability::value_objects::VulnerabilitySource::OSV],
+        sources: vec![
+            vulnera_contract::domain::vulnerability::value_objects::VulnerabilitySource::OSV,
+        ],
         references: vec![],
     };
     mock_repo.add_vuln("express", vuln);
 
     let use_case =
-        AnalyzeDependenciesUseCase::new(parser_factory, Arc::new(mock_repo), mock_cache, 10);
+        AnalyzeDependenciesUseCase::new(parser_factory, Some(Arc::new(mock_repo)), mock_cache, 10);
 
     // Mock package.json content
     let content = r#"{
@@ -179,7 +182,7 @@ async fn test_analyze_dependencies_cache_hit() {
     let mock_cache = Arc::new(MockCacheService::new());
 
     let _use_case =
-        AnalyzeDependenciesUseCase::new(parser_factory, mock_repo, mock_cache.clone(), 10);
+        AnalyzeDependenciesUseCase::new(parser_factory, Some(mock_repo), mock_cache.clone(), 10);
 
     let _content = r#"
         [package]
@@ -207,7 +210,7 @@ async fn test_analyze_dependencies_cache_hit() {
 
     let use_case_with_ctx = AnalyzeDependenciesUseCase::new_with_context(
         Arc::new(ParserFactory::default()),
-        Arc::new(MockVulnerabilityRepository::new()),
+        Some(Arc::new(MockVulnerabilityRepository::new())),
         mock_cache.clone(),
         10,
         5,
@@ -235,7 +238,7 @@ async fn test_analyze_dependencies_empty() {
     let mock_repo = Arc::new(MockVulnerabilityRepository::new());
     let mock_cache = Arc::new(MockCacheService::new());
 
-    let use_case = AnalyzeDependenciesUseCase::new(parser_factory, mock_repo, mock_cache, 10);
+    let use_case = AnalyzeDependenciesUseCase::new(parser_factory, Some(mock_repo), mock_cache, 10);
 
     let _content = ""; // Empty content
     // Cargo parser might fail on empty content, so let's use a valid but empty manifest

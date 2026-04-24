@@ -7,12 +7,12 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use vulnera_core::Config;
-use vulnera_core::application::errors::ApplicationError;
-use vulnera_core::application::vulnerability::services::CacheService;
-use vulnera_core::domain::vulnerability::entities::{Package, Vulnerability};
-use vulnera_core::domain::vulnerability::repositories::IVulnerabilityRepository;
-use vulnera_core::domain::vulnerability::value_objects::Ecosystem;
+use crate::application::errors::ApplicationError;
+use vulnera_contract::Config;
+use vulnera_contract::domain::vulnerability::entities::{Package, Vulnerability};
+use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityRepository;
+use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
+use vulnera_infrastructure::application::vulnerability::services::CacheService;
 
 /// Service for managing popular package vulnerabilities with efficient caching
 #[async_trait]
@@ -38,7 +38,7 @@ pub struct PopularPackageVulnerabilityResult {
 
 /// Service implementation for popular package vulnerability management
 pub struct PopularPackageServiceImpl<C: CacheService> {
-    vulnerability_repository: Arc<dyn IVulnerabilityRepository>,
+    vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
     cache_service: Arc<C>,
     config: Arc<Config>,
 }
@@ -46,7 +46,7 @@ pub struct PopularPackageServiceImpl<C: CacheService> {
 impl<C: CacheService> PopularPackageServiceImpl<C> {
     /// Create a new popular package service
     pub fn new(
-        vulnerability_repository: Arc<dyn IVulnerabilityRepository>,
+        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
         cache_service: Arc<C>,
         config: Arc<Config>,
     ) -> Self {
@@ -150,16 +150,19 @@ impl<C: CacheService> PopularPackageServiceImpl<C> {
             packages.len()
         );
 
+        let Some(repo) = self.vulnerability_repository.clone() else {
+            return Ok(Vec::new());
+        };
+
         let mut join_set: JoinSet<Result<Vec<Vulnerability>, ApplicationError>> = JoinSet::new();
         let max_concurrent = 10; // Limit concurrent queries to avoid overwhelming the system
-        let repo = self.vulnerability_repository.clone();
 
         // Process packages in chunks for bounded concurrency
         for chunk in packages.chunks(max_concurrent) {
             // Spawn tasks for current chunk
             for (ecosystem, name, version) in chunk {
                 if let Ok(version_obj) =
-                    vulnera_core::domain::vulnerability::value_objects::Version::parse(version)
+                    vulnera_contract::domain::vulnerability::value_objects::Version::parse(version)
                 {
                     let ecosystem_clone = ecosystem.clone();
                     if let Ok(package) = Package::new(name.clone(), version_obj, ecosystem_clone) {
@@ -279,13 +282,17 @@ impl<C: CacheService> PopularPackageService for PopularPackageServiceImpl<C> {
         if let Some(severity_filter) = severity_filter {
             let filter_severity = match severity_filter.to_lowercase().as_str() {
                 "critical" => {
-                    Some(vulnera_core::domain::vulnerability::value_objects::Severity::Critical)
+                    Some(vulnera_contract::domain::vulnerability::value_objects::Severity::Critical)
                 }
-                "high" => Some(vulnera_core::domain::vulnerability::value_objects::Severity::High),
+                "high" => {
+                    Some(vulnera_contract::domain::vulnerability::value_objects::Severity::High)
+                }
                 "medium" => {
-                    Some(vulnera_core::domain::vulnerability::value_objects::Severity::Medium)
+                    Some(vulnera_contract::domain::vulnerability::value_objects::Severity::Medium)
                 }
-                "low" => Some(vulnera_core::domain::vulnerability::value_objects::Severity::Low),
+                "low" => {
+                    Some(vulnera_contract::domain::vulnerability::value_objects::Severity::Low)
+                }
                 _ => None,
             };
 

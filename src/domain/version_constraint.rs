@@ -3,7 +3,7 @@
 //! This module provides parsing and manipulation of version constraints
 //! (^1.2.3, ~1.2.3, >=1.0.0, etc.) used across different package ecosystems.
 
-use vulnera_core::domain::vulnerability::value_objects::Version;
+use vulnera_contract::domain::vulnerability::value_objects::Version;
 
 /// Version constraint for dependency specifications
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

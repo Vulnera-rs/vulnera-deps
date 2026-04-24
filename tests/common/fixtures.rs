@@ -1,6 +1,6 @@
 //! Test data fixtures for vulnera-deps
 
-use vulnera_core::domain::vulnerability::{
+use vulnera_contract::domain::vulnerability::{
     entities::Package,
     value_objects::{Ecosystem, Version},
 };

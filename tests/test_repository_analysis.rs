@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use vulnera_contract::Config;
-use vulnera_contract::VulnerabilityError;
+use vulnera_contract::application::errors::VulnerabilityError;
 use vulnera_contract::domain::vulnerability::entities::{Package, Vulnerability};
 use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityRepository;
 use vulnera_contract::domain::vulnerability::value_objects::VulnerabilityId;
@@ -10,8 +10,8 @@ use vulnera_deps::ParserFactory;
 use vulnera_deps::services::repository_analysis::{
     RepositoryAnalysisInput, RepositoryAnalysisService, RepositoryAnalysisServiceImpl,
 };
-use vulnera_infrastructure::application::errors::ApplicationError;
-use vulnera_infrastructure::infrastructure::repository_source::{
+use vulnera_contract::application::errors::ApplicationError;
+use vulnera_contract::infrastructure::repository_source::{
     FetchedFileContent, RepositoryFile, RepositorySourceClient, RepositorySourceError,
     RepositorySourceResult,
 };

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vulnera_contract::VulnerabilityError;
+use vulnera_contract::application::errors::VulnerabilityError;
 use vulnera_contract::domain::vulnerability::entities::{AffectedPackage, Package, Vulnerability};
 use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityRepository;
 use vulnera_contract::domain::vulnerability::value_objects::{
@@ -13,8 +13,8 @@ use vulnera_contract::domain::vulnerability::value_objects::{
 };
 use vulnera_deps::ParserFactory;
 use vulnera_deps::use_cases::AnalyzeDependenciesUseCase;
-use vulnera_infrastructure::application::errors::{ApplicationError, CacheError};
-use vulnera_infrastructure::application::vulnerability::services::CacheService;
+use vulnera_contract::application::errors::{ApplicationError, CacheError};
+use vulnera_contract::application::vulnerability::services::CacheService;
 
 // --- Mocks ---
 

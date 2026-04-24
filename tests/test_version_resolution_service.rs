@@ -12,7 +12,7 @@ use vulnera_contract::domain::vulnerability::value_objects::{
 };
 use vulnera_deps::services::version_resolution::VersionResolutionServiceImpl;
 use vulnera_deps::types::VersionResolutionService;
-use vulnera_infrastructure::infrastructure::registries::{
+use vulnera_contract::infrastructure::registries::{
     PackageRegistryClient, RegistryError, RegistryPackageMetadata, VersionInfo,
 };
 

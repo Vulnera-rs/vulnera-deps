@@ -237,7 +237,6 @@ impl AnalysisModule for DependencyAnalyzerModule {
                         vulnera_contract::domain::vulnerability::value_objects::Severity::Low => {
                             FindingSeverity::Low
                         }
-                        _ => FindingSeverity::Info,
                     },
                     confidence: FindingConfidence::High,
                     description: vuln.description.clone(),

@@ -11,10 +11,10 @@ use vulnera_contract::domain::vulnerability::{
     repositories::IVulnerabilityRepository,
     value_objects::{Ecosystem, VulnerabilityId},
 };
-use vulnera_infrastructure::application::vulnerability::services::CacheService;
+use vulnera_contract::application::vulnerability::services::CacheService;
 
 use crate::parsers::{ParseResult, ParserFactory};
-use vulnera_infrastructure::infrastructure::registries::{
+use vulnera_contract::infrastructure::registries::{
     PackageRegistryClient, VulneraRegistryAdapter,
 };
 
@@ -361,8 +361,8 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                     join_set.spawn(async move {
                         let _permit = permit.acquire().await.map_err(|e| {
                             ApplicationError::Vulnerability(
-                                vulnera_infrastructure::application::errors::VulnerabilityError::Api(
-                                    vulnera_infrastructure::application::errors::ApiError::Http {
+                                vulnera_contract::application::errors::VulnerabilityError::Api(
+                                    vulnera_contract::application::errors::ApiError::Http {
                                         status: 500,
                                         message: format!("Failed to acquire semaphore: {}", e),
                                     },
@@ -639,7 +639,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                             let package_id = package_arc.identifier();
 
                             // Use optimized cache key generation
-                            let cache_key = vulnera_infrastructure::infrastructure::cache::CacheServiceImpl::package_vulnerabilities_key(&package_arc);
+                            let cache_key = vulnera_contract::infrastructure::cache::CacheServiceImpl::package_vulnerabilities_key(&package_arc);
 
                             // Check cache first
                             if let Ok(Some(cached_vulns)) =
@@ -740,7 +740,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
         HashMap<PackageId, Vec<vulnera_contract::domain::vulnerability::value_objects::Version>>,
         ApplicationError,
     > {
-        use vulnera_infrastructure::infrastructure::registries::VulneraRegistryAdapter;
+        use vulnera_contract::infrastructure::registries::VulneraRegistryAdapter;
 
         let registry: Arc<dyn PackageRegistryClient> = Arc::new(VulneraRegistryAdapter::new());
 
@@ -769,8 +769,8 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
             join_set.spawn(async move {
                 let _permit = permit.acquire().await.map_err(|e| {
                     ApplicationError::Vulnerability(
-                        vulnera_infrastructure::application::errors::VulnerabilityError::Api(
-                            vulnera_infrastructure::application::errors::ApiError::Http {
+                        vulnera_contract::application::errors::VulnerabilityError::Api(
+                            vulnera_contract::application::errors::ApiError::Http {
                                 status: 500,
                                 message: format!("Failed to acquire semaphore: {}", e),
                             },

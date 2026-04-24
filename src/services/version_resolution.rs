@@ -10,8 +10,8 @@ use std::time::Duration;
 use crate::application::errors::ApplicationError;
 use vulnera_contract::domain::vulnerability::entities::Vulnerability;
 use vulnera_contract::domain::vulnerability::value_objects::{Ecosystem, Version};
-use vulnera_infrastructure::application::vulnerability::services::CacheService;
-use vulnera_infrastructure::infrastructure::registries::PackageRegistryClient;
+use vulnera_contract::application::vulnerability::services::CacheService;
+use vulnera_contract::infrastructure::registries::PackageRegistryClient;
 
 use crate::types::{VersionRecommendation, VersionResolutionService, compute_upgrade_impact};
 
@@ -58,7 +58,7 @@ where
     R: PackageRegistryClient,
 {
     registry: Arc<R>,
-    cache_service: Option<Arc<vulnera_infrastructure::infrastructure::cache::CacheServiceImpl>>,
+    cache_service: Option<Arc<vulnera_contract::infrastructure::cache::CacheServiceImpl>>,
     registry_versions_ttl: Duration,
     /// When true, exclude prerelease versions from recommendations
     exclude_prereleases: bool,
@@ -92,7 +92,7 @@ where
 
     pub fn new_with_cache(
         registry: Arc<R>,
-        cache_service: Arc<vulnera_infrastructure::infrastructure::cache::CacheServiceImpl>,
+        cache_service: Arc<vulnera_contract::infrastructure::cache::CacheServiceImpl>,
     ) -> Self {
         // TTL follows backend cache config: VULNERA__CACHE__TTL_HOURS (default 24)
         let ttl_hours = std::env::var("VULNERA__CACHE__TTL_HOURS")
@@ -137,11 +137,11 @@ where
         // Fetch available versions from registry with optional cache
         let versions_res = if let Some(cache) = &self.cache_service {
             let cache_key =
-                vulnera_infrastructure::infrastructure::cache::CacheServiceImpl::registry_versions_key(
+                vulnera_contract::infrastructure::cache::CacheServiceImpl::registry_versions_key(
                     &ecosystem, name,
                 );
             match cache
-                .get::<Vec<vulnera_infrastructure::infrastructure::registries::VersionInfo>>(
+                .get::<Vec<vulnera_contract::infrastructure::registries::VersionInfo>>(
                     &cache_key,
                 )
                 .await
@@ -265,9 +265,9 @@ where
 
         // Build safe sets - pre-allocate with estimated capacity
         let estimated_safe_capacity = (versions.len() * 7) / 10; // 70% estimate
-        let mut safe_all: Vec<&vulnera_infrastructure::infrastructure::registries::VersionInfo> =
+        let mut safe_all: Vec<&vulnera_contract::infrastructure::registries::VersionInfo> =
             Vec::with_capacity(estimated_safe_capacity);
-        let mut safe_stable: Vec<&vulnera_infrastructure::infrastructure::registries::VersionInfo> =
+        let mut safe_stable: Vec<&vulnera_contract::infrastructure::registries::VersionInfo> =
             Vec::with_capacity(estimated_safe_capacity);
         for vi in &versions {
             if !is_vulnerable(&vi.version) {

@@ -12,7 +12,7 @@ use vulnera_contract::domain::vulnerability::entities::Package;
 use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
 
 use crate::parsers::ParserFactory;
-use vulnera_infrastructure::infrastructure::registries::{
+use vulnera_contract::infrastructure::registries::{
     PackageRegistryClient, RegistryError, VersionInfo,
 };
 
@@ -422,7 +422,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use vulnera_contract::domain::vulnerability::value_objects::Version;
-    use vulnera_infrastructure::infrastructure::registries::{
+    use vulnera_contract::infrastructure::registries::{
         RegistryDependency, RegistryPackageMetadata, VersionInfo,
     };
 

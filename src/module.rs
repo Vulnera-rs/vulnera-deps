@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityRepository;
-use vulnera_infrastructure::infrastructure::cache::CacheServiceImpl;
+use vulnera_contract::infrastructure::cache::CacheServiceImpl;
 
 use crate::parsers::ParserFactory;
 

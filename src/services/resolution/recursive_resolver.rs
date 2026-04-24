@@ -7,8 +7,8 @@ use tracing::{debug, warn};
 use crate::application::errors::{ApplicationError, VulnerabilityError};
 use vulnera_contract::domain::vulnerability::entities::Package;
 use vulnera_contract::domain::vulnerability::value_objects::{Ecosystem, Version};
-use vulnera_infrastructure::application::vulnerability::services::CacheService;
-use vulnera_infrastructure::infrastructure::registries::{
+use vulnera_contract::application::vulnerability::services::CacheService;
+use vulnera_contract::infrastructure::registries::{
     PackageRegistryClient, RegistryPackageMetadata,
 };
 

@@ -12,7 +12,7 @@ use vulnera_contract::Config;
 use vulnera_contract::domain::vulnerability::entities::{Package, Vulnerability};
 use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityRepository;
 use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
-use vulnera_infrastructure::application::vulnerability::services::CacheService;
+use vulnera_contract::application::vulnerability::services::CacheService;
 
 /// Service for managing popular package vulnerabilities with efficient caching
 #[async_trait]

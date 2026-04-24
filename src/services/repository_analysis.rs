@@ -13,7 +13,7 @@ use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityReposit
 use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
 
 use crate::parsers::ParserFactory;
-use vulnera_infrastructure::infrastructure::repository_source::RepositorySourceClient;
+use vulnera_contract::infrastructure::repository_source::RepositorySourceClient;
 
 /// Input for analyzing a repository (already validated & parsed from request/URL)
 #[derive(Debug, Clone)]
@@ -115,18 +115,18 @@ impl<C: RepositorySourceClient + 'static> RepositoryAnalysisService
             )
             .await
             .map_err(|e| match e {
-                vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::NotFound(_)
-                | vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::AccessDenied(
+                vulnera_contract::infrastructure::repository_source::RepositorySourceError::NotFound(_)
+                | vulnera_contract::infrastructure::repository_source::RepositorySourceError::AccessDenied(
                     _,
                 ) => ApplicationError::NotFound {
                     resource: "repository".to_string(),
                     id: format!("{}/{}", &input.owner, &input.repo),
                 },
-                vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::RateLimited {
+                vulnera_contract::infrastructure::repository_source::RepositorySourceError::RateLimited {
                     message,
                     ..
                 } => ApplicationError::RateLimited { message },
-                vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::Validation(
+                vulnera_contract::infrastructure::repository_source::RepositorySourceError::Validation(
                     msg,
                 ) => ApplicationError::Domain(
                     vulnera_contract::domain::vulnerability::errors::VulnerabilityDomainError::InvalidInput {
@@ -190,19 +190,19 @@ impl<C: RepositorySourceClient + 'static> RepositoryAnalysisService
                 )
                 .await
                 .map_err(|e| match e {
-                    vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::RateLimited {
+                    vulnera_contract::infrastructure::repository_source::RepositorySourceError::RateLimited {
                         ..
                     } => ApplicationError::RateLimited {
                         message: e.to_string(),
                     },
-                    vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::NotFound(_)
-                    | vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::AccessDenied(
+                    vulnera_contract::infrastructure::repository_source::RepositorySourceError::NotFound(_)
+                    | vulnera_contract::infrastructure::repository_source::RepositorySourceError::AccessDenied(
                         _,
                     ) => ApplicationError::NotFound {
                         resource: "file contents".into(),
                         id: format!("{}/{}", &input.owner, &input.repo),
                     },
-                    vulnera_infrastructure::infrastructure::repository_source::RepositorySourceError::Validation(
+                    vulnera_contract::infrastructure::repository_source::RepositorySourceError::Validation(
                         msg,
                     ) => ApplicationError::Domain(
                         vulnera_contract::domain::vulnerability::errors::VulnerabilityDomainError::InvalidInput {

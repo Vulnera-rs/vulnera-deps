@@ -3,9 +3,9 @@
 //! This module provides data structures for representing dependency graphs,
 //! including nodes (packages), edges (dependencies), and graph algorithms.
 
+use crate::domain::vulnerability::entities::Package;
+use crate::domain::vulnerability::value_objects::Version;
 use std::collections::{HashMap, HashSet};
-use vulnera_contract::domain::vulnerability::entities::Package;
-use vulnera_contract::domain::vulnerability::value_objects::Version;
 
 use super::source_location::SourceLocation;
 use super::version_constraint::VersionConstraint;
@@ -353,7 +353,7 @@ impl Default for DependencyGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
+    use crate::domain::vulnerability::value_objects::Ecosystem;
 
     fn create_test_package(name: &str, version: &str) -> Package {
         Package::new(

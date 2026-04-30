@@ -3,10 +3,10 @@
 //! This module provides context management for analyzing dependencies across
 //! entire projects, including workspace detection and configuration management.
 
-use globset::{Glob, GlobSetBuilder};
+use crate::domain::vulnerability::value_objects::Ecosystem;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
 
 /// Configuration for dependency analysis
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -64,67 +64,56 @@ pub struct AnalysisContext {
     pub config: AnalysisConfig,
     /// Cached analysis results (file path -> last analysis time)
     pub cache: HashMap<PathBuf, std::time::SystemTime>,
+    /// Pre-compiled glob patterns for ignore matching
+    compiled_patterns: GlobSet,
 }
 
 impl AnalysisContext {
-    /// Create a new analysis context
-    pub fn new(project_root: impl AsRef<Path>) -> Self {
-        Self {
-            project_root: project_root.as_ref().to_path_buf(),
-            workspace: None,
-            config: AnalysisConfig::default(),
-            cache: HashMap::new(),
+    /// Build a GlobSet from ignore patterns
+    fn build_globset(patterns: &[String]) -> GlobSet {
+        let mut builder = GlobSetBuilder::new();
+        for pattern in patterns {
+            let normalized = pattern.replace('\\', "/");
+            if let Ok(glob) = Glob::new(&normalized) {
+                builder.add(glob);
+            }
+            let prefixed = format!("**/{normalized}");
+            if let Ok(glob) = Glob::new(&prefixed) {
+                builder.add(glob);
+            }
         }
+        builder.build().unwrap_or_else(|_| GlobSet::empty())
     }
 
-    /// Create a new analysis context with configuration
-    pub fn with_config(project_root: impl AsRef<Path>, config: AnalysisConfig) -> Self {
+    /// Create a new analysis context
+    pub fn new(project_root: impl AsRef<Path>) -> Self {
+        let config = AnalysisConfig::default();
+        let compiled_patterns = Self::build_globset(&config.ignore_patterns);
         Self {
             project_root: project_root.as_ref().to_path_buf(),
             workspace: None,
             config,
             cache: HashMap::new(),
+            compiled_patterns,
+        }
+    }
+
+    /// Create a new analysis context with configuration
+    pub fn with_config(project_root: impl AsRef<Path>, config: AnalysisConfig) -> Self {
+        let compiled_patterns = Self::build_globset(&config.ignore_patterns);
+        Self {
+            project_root: project_root.as_ref().to_path_buf(),
+            workspace: None,
+            config,
+            cache: HashMap::new(),
+            compiled_patterns,
         }
     }
 
     /// Check if a path should be ignored based on ignore patterns
     pub fn should_ignore(&self, path: &Path) -> bool {
         let normalized = normalize_path(path);
-        let suffix = normalized
-            .split_once('/')
-            .map(|(_, rest)| rest)
-            .unwrap_or(normalized.as_str());
-
-        for pattern in &self.config.ignore_patterns {
-            if self.matches_pattern(&normalized, suffix, pattern) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn matches_pattern(&self, path: &str, suffix: &str, pattern: &str) -> bool {
-        let mut builder = GlobSetBuilder::new();
-        let normalized_pattern = pattern.replace('\\', "/");
-
-        let glob = match Glob::new(&normalized_pattern) {
-            Ok(glob) => glob,
-            Err(_) => return false,
-        };
-
-        builder.add(glob);
-
-        let prefixed_pattern = format!("**/{normalized_pattern}");
-        if let Ok(prefixed_glob) = Glob::new(&prefixed_pattern) {
-            builder.add(prefixed_glob);
-        }
-
-        let set = match builder.build() {
-            Ok(set) => set,
-            Err(_) => return false,
-        };
-
-        set.is_match(path) || set.is_match(suffix)
+        self.compiled_patterns.is_match(&normalized)
     }
 
     /// Update cache entry for a file

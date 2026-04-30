@@ -3,7 +3,7 @@
 #![allow(clippy::collapsible_if)]
 
 use super::traits::{FilePattern, PackageFileParser, ParseResult, SourceType};
-use crate::application::errors::ParseError;
+use crate::domain::errors::ParseError;
 use crate::domain::vulnerability::{
     entities::Package,
     value_objects::{Ecosystem, Version},
@@ -566,7 +566,13 @@ fn try_extract_named(node: &Node, content: &str, packages: &mut Vec<Package>) {
             if kind == "argument_list" || kind == "value_arguments" || kind == "call_suffix" {
                 // Recurse into argument containers for both Groovy and Kotlin
                 let inner = named_children_vec(child);
-                try_extract_named_from_slice(&inner, content, &mut group, &mut artifact, &mut version);
+                try_extract_named_from_slice(
+                    &inner,
+                    content,
+                    &mut group,
+                    &mut artifact,
+                    &mut version,
+                );
             } else if kind == "map_item" {
                 // Groovy named params: group: 'g', name: 'a', version: 'v'
                 let inner = named_children_vec(child);

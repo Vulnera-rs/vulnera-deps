@@ -1,6 +1,6 @@
 use super::traits::{FilePattern, PackageFileParser, ParseResult, SourceType};
 use super::version_extractor;
-use crate::application::errors::ParseError;
+use crate::domain::errors::ParseError;
 use crate::domain::vulnerability::{
     entities::Package,
     value_objects::{Ecosystem, Version},
@@ -66,7 +66,7 @@ impl NuGetPackagesConfigParser {
                                     Some(v) => v,
                                     None => continue,
                                 },
-                                None => Version::parse("0.0.0").unwrap(),
+                                None => Version::new(0, 0, 0),
                             };
 
                             let pkg = Package::new(pkg_name, ver, Ecosystem::NuGet)
@@ -187,11 +187,12 @@ impl NuGetProjectXmlParser {
                         }
                         if let Some(pkg_name) = name
                             && let Some(raw_ver) = ver
-                                && let Some(v) = version_extractor::nuget_locked(&raw_ver)? {
-                                    let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
-                                        .map_err(|e| ParseError::MissingField { field: e })?;
-                                    packages.push(pkg);
-                                }
+                            && let Some(v) = version_extractor::nuget_locked(&raw_ver)?
+                        {
+                            let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
+                                .map_err(|e| ParseError::MissingField { field: e })?;
+                            packages.push(pkg);
+                        }
                     } else if in_package_ref && tag.eq_ignore_ascii_case("Version") {
                         in_version_child = true;
                     }
@@ -221,11 +222,12 @@ impl NuGetProjectXmlParser {
 
                         if let Some(pkg_name) = name_attr
                             && let Some(raw_ver) = version_attr
-                                && let Some(v) = version_extractor::nuget_locked(&raw_ver)? {
-                                    let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
-                                        .map_err(|e| ParseError::MissingField { field: e })?;
-                                    packages.push(pkg);
-                                }
+                            && let Some(v) = version_extractor::nuget_locked(&raw_ver)?
+                        {
+                            let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
+                                .map_err(|e| ParseError::MissingField { field: e })?;
+                            packages.push(pkg);
+                        }
                     } else if tag.eq_ignore_ascii_case("PackageVersion") {
                         let mut name_attr: Option<String> = None;
                         let mut version_attr: Option<String> = None;
@@ -245,11 +247,12 @@ impl NuGetProjectXmlParser {
                         }
                         if let Some(pkg_name) = name_attr
                             && let Some(raw_ver) = version_attr
-                                && let Some(v) = version_extractor::nuget_locked(&raw_ver)? {
-                                    let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
-                                        .map_err(|e| ParseError::MissingField { field: e })?;
-                                    packages.push(pkg);
-                                }
+                            && let Some(v) = version_extractor::nuget_locked(&raw_ver)?
+                        {
+                            let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
+                                .map_err(|e| ParseError::MissingField { field: e })?;
+                            packages.push(pkg);
+                        }
                     }
                 }
                 Ok(Event::Text(t)) if in_package_ref && in_version_child => {
@@ -272,11 +275,12 @@ impl NuGetProjectXmlParser {
                         // Finalize this package ref
                         if let Some(pkg_name) = current_name.take()
                             && let Some(raw_ver) = current_version.take()
-                                && let Some(v) = version_extractor::nuget_locked(&raw_ver)? {
-                                    let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
-                                        .map_err(|e| ParseError::MissingField { field: e })?;
-                                    packages.push(pkg);
-                                }
+                            && let Some(v) = version_extractor::nuget_locked(&raw_ver)?
+                        {
+                            let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
+                                .map_err(|e| ParseError::MissingField { field: e })?;
+                            packages.push(pkg);
+                        }
                         in_package_ref = false;
                         in_version_child = false;
                     }

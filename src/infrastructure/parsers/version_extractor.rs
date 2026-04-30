@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::application::errors::ParseError;
+use crate::domain::errors::ParseError;
 use crate::domain::vulnerability::value_objects::Version;
 
 // Centralized version extraction for all ecosystems.
@@ -228,12 +228,13 @@ fn normalize_python_prerelease(s: &str) -> String {
     // Use a simple manual scan from the right to find the prerelease marker.
     // First, try the regex approach:
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"^(\d+\.\d+(?:\.\d+)?)(a|b|rc)(\d+)$").unwrap()
+        regex::Regex::new(r"^(\d+\.\d+(?:\.\d+)?)(a|b|rc)(\d+)$")
+            .expect("pre-release version regex is valid")
     });
     if let Some(caps) = RE.captures(s) {
-        let base = caps.get(1).unwrap().as_str();
-        let pre_type = caps.get(2).unwrap().as_str();
-        let pre_num = caps.get(3).unwrap().as_str();
+        let base = &caps[1];
+        let pre_type = &caps[2];
+        let pre_num = &caps[3];
         let semver_pre = match pre_type {
             "a" => "alpha",
             "b" => "beta",

@@ -2,7 +2,7 @@
 
 use super::traits::{FilePattern, PackageFileParser, ParseResult, SourceType};
 use super::version_extractor;
-use crate::application::errors::ParseError;
+use crate::domain::errors::ParseError;
 use crate::domain::vulnerability::{entities::Package, value_objects::Ecosystem};
 
 /// Parser for go.mod files

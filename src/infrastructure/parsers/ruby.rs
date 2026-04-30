@@ -12,7 +12,7 @@
 
 use super::traits::{FilePattern, PackageFileParser, ParseResult, SourceType};
 use super::version_extractor;
-use crate::application::errors::ParseError;
+use crate::domain::errors::ParseError;
 use crate::domain::vulnerability::{
     entities::{Dependency, Package},
     value_objects::{Ecosystem, Version},
@@ -26,11 +26,13 @@ fn is_comment_or_blank(line: &str) -> bool {
 }
 
 static RE_GEM_LINE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(r#"(?i)^\s*gem\s+["']([^"']+)["']\s*(?:,\s*(.+))?\s*$"#).unwrap()
+    Regex::new(r#"(?i)^\s*gem\s+["']([^"']+)["']\s*(?:,\s*(.+))?\s*$"#)
+        .expect("gemfile regex is valid")
 });
 
-static RE_QUOTED_STRING: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r#""([^"]+)"|'([^']+)'"#).unwrap());
+static RE_QUOTED_STRING: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r#""([^"]+)"|'([^']+)'"#).expect("gemfile version regex is valid")
+});
 
 // ── Lock state machine ────────────────────────────────────────────────────────
 
@@ -144,9 +146,9 @@ impl GemfileParser {
                 let version = match maybe_constraint {
                     Some(ref c) => match version_extractor::gem_manifest(c)? {
                         Some((_, ver)) => ver,
-                        None => Version::parse("0.0.0").unwrap(),
+                        None => Version::new(0, 0, 0),
                     },
-                    None => Version::parse("0.0.0").unwrap(),
+                    None => Version::new(0, 0, 0),
                 };
 
                 let package = Package::new(name, version, Ecosystem::RubyGems)
@@ -227,13 +229,13 @@ impl GemfileLockParser {
                 LockState::InSpecs => {
                     if indent == 4
                         && let Some((name, raw_version)) = parse_lock_package_entry(trimmed)
-                            && let Some(version) = version_extractor::gem_locked(raw_version)? {
-                                let package =
-                                    Package::new(name.to_string(), version, Ecosystem::RubyGems)
-                                        .map_err(|e| ParseError::MissingField { field: e })?;
-                                packages.push(package.clone());
-                                state = LockState::InDeps(package);
-                            }
+                        && let Some(version) = version_extractor::gem_locked(raw_version)?
+                    {
+                        let package = Package::new(name.to_string(), version, Ecosystem::RubyGems)
+                            .map_err(|e| ParseError::MissingField { field: e })?;
+                        packages.push(package.clone());
+                        state = LockState::InDeps(package);
+                    }
                 }
                 LockState::InDeps(current) => {
                     if indent == 6 {
@@ -246,13 +248,13 @@ impl GemfileLockParser {
                         }
                     } else if indent == 4
                         && let Some((name, raw_version)) = parse_lock_package_entry(trimmed)
-                            && let Some(version) = version_extractor::gem_locked(raw_version)? {
-                                let package =
-                                    Package::new(name.to_string(), version, Ecosystem::RubyGems)
-                                        .map_err(|e| ParseError::MissingField { field: e })?;
-                                packages.push(package.clone());
-                                state = LockState::InDeps(package);
-                            }
+                        && let Some(version) = version_extractor::gem_locked(raw_version)?
+                    {
+                        let package = Package::new(name.to_string(), version, Ecosystem::RubyGems)
+                            .map_err(|e| ParseError::MissingField { field: e })?;
+                        packages.push(package.clone());
+                        state = LockState::InDeps(package);
+                    }
                 }
             }
         }

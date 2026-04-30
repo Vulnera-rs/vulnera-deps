@@ -2,7 +2,7 @@
 
 use super::traits::{FilePattern, PackageFileParser, ParseResult, SourceType};
 use super::version_extractor;
-use crate::application::errors::ParseError;
+use crate::domain::errors::ParseError;
 use crate::domain::vulnerability::{
     entities::Package,
     value_objects::{Ecosystem, Version},
@@ -46,10 +46,15 @@ impl RequirementsTxtParser {
             }
         }
 
-        // Try pep508_rs parsing - if it fails (e.g. old-style VCS URLs), skip
+        // Try pep508_rs parsing
         let requirement: Requirement<VerbatimUrl> = match Requirement::from_str(line) {
             Ok(r) => r,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                return Err(ParseError::InvalidContent(format!(
+                    "failed to parse requirement line '{}': {}",
+                    line, e
+                )));
+            }
         };
 
         match requirement.version_or_url {
@@ -65,9 +70,8 @@ impl RequirementsTxtParser {
             }
             None => {
                 let version = Version::new(0, 0, 0);
-                let package =
-                    Package::new(requirement.name.to_string(), version, Ecosystem::PyPI)
-                        .map_err(|e| ParseError::MissingField { field: e })?;
+                let package = Package::new(requirement.name.to_string(), version, Ecosystem::PyPI)
+                    .map_err(|e| ParseError::MissingField { field: e })?;
                 Ok(Some(package))
             }
             _ => Ok(None),
@@ -139,7 +143,7 @@ impl PipfileParser {
 
                 let version = match version_extractor::python(&version_str)? {
                     Some((_, v)) => v,
-                    None => Version::parse("0.0.0").unwrap(),
+                    None => Version::new(0, 0, 0),
                 };
 
                 let package = Package::new(name.clone(), version, Ecosystem::PyPI)
@@ -220,7 +224,7 @@ impl PyProjectTomlParser {
 
                 let version = match version_extractor::python(&version_str)? {
                     Some((_, v)) => v,
-                    None => Version::parse("0.0.0").unwrap(),
+                    None => Version::new(0, 0, 0),
                 };
 
                 let package = Package::new(name.clone(), version, Ecosystem::PyPI)
@@ -406,7 +410,8 @@ package3==1.2.3a4
     fn test_requirements_txt_with_trailing_backslash_and_comment() {
         // Trailing backslash is not standard pip continuation; verify it's skipped
         let parser = RequirementsTxtParser::new();
-        let content = "requests>=2.25.1\n# next line after backslash is just a comment\nflask>=1.1.0";
+        let content =
+            "requests>=2.25.1\n# next line after backslash is just a comment\nflask>=1.1.0";
         let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 2);
     }

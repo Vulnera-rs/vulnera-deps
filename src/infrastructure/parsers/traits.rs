@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::application::errors::ParseError;
+use crate::domain::errors::ParseError;
 use crate::domain::vulnerability::entities::{Dependency, Package};
 use crate::domain::vulnerability::value_objects::Ecosystem;
 
@@ -10,14 +10,12 @@ pub enum FilePattern {
     Extension(&'static str),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SourceType {
     #[default]
     Manifest,
     LockFile,
 }
-
 
 #[derive(Debug, Default)]
 pub struct ParseResult {
@@ -62,7 +60,7 @@ impl ParserFactory {
         }
     }
 
-    pub fn register(mut self, parser: Arc<dyn PackageFileParser>) -> Self {
+    fn build_entry(parser: Arc<dyn PackageFileParser>, priority: u8) -> ParserEntry {
         let patterns = parser.patterns();
         let eco = parser.ecosystem();
         let mut name_patterns = Vec::new();
@@ -73,13 +71,17 @@ impl ParserFactory {
                 FilePattern::Extension(e) => ext_patterns.push(*e),
             }
         }
-        self.entries.push(ParserEntry {
+        ParserEntry {
             parser,
             name_patterns,
             ext_patterns,
-            priority: 0,
+            priority,
             ecosystem: eco,
-        });
+        }
+    }
+
+    pub fn register(mut self, parser: Arc<dyn PackageFileParser>) -> Self {
+        self.entries.push(Self::build_entry(parser, 0));
         self
     }
 
@@ -88,23 +90,7 @@ impl ParserFactory {
         parser: Arc<dyn PackageFileParser>,
         priority: u8,
     ) -> Self {
-        let patterns = parser.patterns();
-        let eco = parser.ecosystem();
-        let mut name_patterns = Vec::new();
-        let mut ext_patterns = Vec::new();
-        for p in patterns.iter() {
-            match p {
-                FilePattern::Name(n) => name_patterns.push(*n),
-                FilePattern::Extension(e) => ext_patterns.push(*e),
-            }
-        }
-        self.entries.push(ParserEntry {
-            parser,
-            name_patterns,
-            ext_patterns,
-            priority,
-            ecosystem: eco,
-        });
+        self.entries.push(Self::build_entry(parser, priority));
         self
     }
 
@@ -162,14 +148,16 @@ impl ParserFactory {
 
         for entry in &self.entries {
             if let Some(fname) = file_name
-                && entry.name_patterns.contains(&fname) {
-                    candidates.push(entry);
-                    continue;
-                }
+                && entry.name_patterns.contains(&fname)
+            {
+                candidates.push(entry);
+                continue;
+            }
             if let Some(ext) = extension
-                && entry.ext_patterns.contains(&ext) {
-                    candidates.push(entry);
-                }
+                && entry.ext_patterns.contains(&ext)
+            {
+                candidates.push(entry);
+            }
         }
 
         candidates

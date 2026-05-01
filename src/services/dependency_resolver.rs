@@ -4,17 +4,14 @@
 //! and building complete dependency graphs from manifest and lockfiles.
 
 use crate::application::errors::ApplicationError;
+use crate::domain::vulnerability::entities::Package;
+use crate::domain::vulnerability::value_objects::Ecosystem;
 use async_trait::async_trait;
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tracing::{debug, warn};
-use vulnera_contract::domain::vulnerability::entities::Package;
-use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
 
-use crate::parsers::ParserFactory;
-use vulnera_contract::infrastructure::registries::{
-    PackageRegistryClient, RegistryError, VersionInfo,
-};
+use crate::infrastructure::parsers::ParserFactory;
+use crate::infrastructure::registries::{PackageRegistryClient, RegistryError};
 
 use crate::domain::{
     DependencyEdge, DependencyGraph, PackageId, PackageMetadata, PackageNode,
@@ -28,7 +25,7 @@ pub trait DependencyResolverService: Send + Sync {
     async fn build_graph(
         &self,
         packages: Vec<Package>,
-        dependencies: Vec<vulnera_contract::domain::vulnerability::entities::Dependency>,
+        dependencies: Vec<crate::domain::vulnerability::entities::Dependency>,
         ecosystem: Ecosystem,
     ) -> Result<DependencyGraph, ApplicationError>;
 
@@ -41,24 +38,12 @@ pub trait DependencyResolverService: Send + Sync {
 }
 
 /// Implementation of dependency resolver service
-pub struct DependencyResolverServiceImpl {
-    _parser_factory: Arc<ParserFactory>,
-}
+#[derive(Default)]
+pub struct DependencyResolverServiceImpl;
 
 impl DependencyResolverServiceImpl {
-    pub fn new(parser_factory: Arc<ParserFactory>) -> Self {
-        Self {
-            _parser_factory: parser_factory,
-        }
-    }
-
-    fn package_key(package: &Package) -> String {
-        format!(
-            "{}:{}@{}",
-            package.ecosystem.canonical_name(),
-            package.name,
-            package.version
-        )
+    pub fn new() -> Self {
+        Self
     }
 
     fn map_registry_error(error: RegistryError, resource: &str) -> ApplicationError {
@@ -81,19 +66,6 @@ impl DependencyResolverServiceImpl {
             }
         }
     }
-
-    fn select_best_version(
-        versions: Vec<VersionInfo>,
-        requirement: &str,
-    ) -> Option<vulnera_contract::domain::vulnerability::value_objects::Version> {
-        let constraint = VersionConstraint::parse(requirement).unwrap_or(VersionConstraint::Any);
-
-        versions
-            .into_iter()
-            .map(|v| v.version)
-            .filter(|version| constraint.satisfies(version))
-            .max()
-    }
 }
 
 #[async_trait]
@@ -101,7 +73,7 @@ impl DependencyResolverService for DependencyResolverServiceImpl {
     async fn build_graph(
         &self,
         packages: Vec<Package>,
-        dependencies: Vec<vulnera_contract::domain::vulnerability::entities::Dependency>,
+        dependencies: Vec<crate::domain::vulnerability::entities::Dependency>,
         _ecosystem: Ecosystem,
     ) -> Result<DependencyGraph, ApplicationError> {
         let mut graph = DependencyGraph::new();
@@ -157,96 +129,31 @@ impl DependencyResolverService for DependencyResolverServiceImpl {
             package.name, package.version
         );
 
-        let mut queue = VecDeque::new();
-        queue.push_back(package.clone());
+        // Check root package metadata is reachable before delegating
+        registry
+            .fetch_metadata(package.ecosystem.clone(), &package.name, &package.version)
+            .await
+            .map_err(|e| {
+                Self::map_registry_error(e, &format!("{}@{}", package.name, package.version))
+            })?;
 
-        let mut visited = HashSet::new();
-        let mut discovered: HashMap<String, Package> = HashMap::new();
+        let cache = Arc::new(crate::services::cache::NoopCacheService);
+        let resolver = crate::services::resolution::RecursiveResolver::new(registry, cache, 10);
+        let result = resolver
+            .resolve(vec![package.clone()], package.ecosystem.clone())
+            .await?;
 
-        while let Some(current) = queue.pop_front() {
-            let current_key = Self::package_key(&current);
-            if !visited.insert(current_key) {
-                continue;
-            }
+        // Filter out the root package to match original behavior (only transitives)
+        let root_id = PackageId::from_package(package);
+        let packages: Vec<Package> = result
+            .graph
+            .nodes
+            .into_values()
+            .filter(|n| n.id != root_id)
+            .map(|n| n.package)
+            .collect();
 
-            let metadata = match registry
-                .fetch_metadata(current.ecosystem.clone(), &current.name, &current.version)
-                .await
-            {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    if current.name == package.name && current.version == package.version {
-                        return Err(Self::map_registry_error(
-                            error,
-                            &format!("{}@{}", current.name, current.version),
-                        ));
-                    }
-
-                    warn!(
-                        package = %current.identifier(),
-                        "Failed to fetch metadata for transitive package: {}",
-                        error
-                    );
-                    continue;
-                }
-            };
-
-            for dependency in metadata.dependencies {
-                if dependency.is_dev || dependency.is_optional {
-                    continue;
-                }
-
-                let versions = match registry
-                    .list_versions(current.ecosystem.clone(), &dependency.name)
-                    .await
-                {
-                    Ok(versions) => versions,
-                    Err(error) => {
-                        warn!(
-                            dependency = %dependency.name,
-                            requirement = %dependency.requirement,
-                            "Failed to list versions for dependency: {}",
-                            error
-                        );
-                        continue;
-                    }
-                };
-
-                let Some(version) = Self::select_best_version(versions, &dependency.requirement)
-                else {
-                    warn!(
-                        dependency = %dependency.name,
-                        requirement = %dependency.requirement,
-                        "No compatible version found for dependency requirement"
-                    );
-                    continue;
-                };
-
-                let transitive_package =
-                    match Package::new(dependency.name.clone(), version, current.ecosystem.clone())
-                    {
-                        Ok(package) => package,
-                        Err(error) => {
-                            warn!(
-                                dependency = %dependency.name,
-                                "Failed to build transitive package model: {}",
-                                error
-                            );
-                            continue;
-                        }
-                    };
-
-                let key = Self::package_key(&transitive_package);
-                if discovered.contains_key(&key) {
-                    continue;
-                }
-
-                discovered.insert(key, transitive_package.clone());
-                queue.push_back(transitive_package);
-            }
-        }
-
-        Ok(discovered.into_values().collect())
+        Ok(packages)
     }
 }
 
@@ -264,8 +171,7 @@ pub async fn build_graph_from_lockfile(
     })?;
 
     let packages = parser
-        .parse_file(lockfile_content)
-        .await
+        .parse(lockfile_content)
         .map_err(ApplicationError::Parse)?;
 
     let mut graph = DependencyGraph::new();
@@ -331,8 +237,7 @@ pub async fn build_graph_from_manifest(
     })?;
 
     let packages = parser
-        .parse_file(manifest_content)
-        .await
+        .parse(manifest_content)
         .map_err(ApplicationError::Parse)?;
 
     let mut graph = DependencyGraph::new();
@@ -377,7 +282,7 @@ pub async fn build_graph_from_manifest(
         // Resolve transitive dependencies for each direct dependency
         // Note: This is a best-effort operation as most registries don't expose
         // dependency information directly. Lockfiles are preferred for complete trees.
-        let resolver = DependencyResolverServiceImpl::new(parser_factory.clone());
+        let resolver = DependencyResolverServiceImpl::new();
         for package in &packages_clone {
             match resolver.resolve_transitive(package, registry.clone()).await {
                 Ok(transitive_deps) => {
@@ -420,11 +325,12 @@ pub async fn build_graph_from_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use vulnera_contract::domain::vulnerability::value_objects::Version;
-    use vulnera_contract::infrastructure::registries::{
+    use crate::domain::vulnerability::value_objects::Version;
+    use crate::infrastructure::registries::{
         RegistryDependency, RegistryPackageMetadata, VersionInfo,
     };
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     #[derive(Default)]
     struct MockRegistryClient {
@@ -506,14 +412,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_graph_from_manifest() {
-        let parser_factory = Arc::new(ParserFactory::new());
-        let resolver = DependencyResolverServiceImpl::new(parser_factory.clone());
+        let resolver = DependencyResolverServiceImpl::new();
 
         let packages = vec![
             Package::new(
                 "express".to_string(),
-                vulnera_contract::domain::vulnerability::value_objects::Version::parse("4.17.1")
-                    .unwrap(),
+                crate::domain::vulnerability::value_objects::Version::parse("4.17.1").unwrap(),
                 Ecosystem::Npm,
             )
             .unwrap(),
@@ -530,8 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_transitive_resolves_nested_dependencies() {
-        let parser_factory = Arc::new(ParserFactory::new());
-        let resolver = DependencyResolverServiceImpl::new(parser_factory);
+        let resolver = DependencyResolverServiceImpl::new();
 
         let root = Package::new(
             "root".to_string(),
@@ -590,8 +493,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_transitive_skips_dev_and_optional_dependencies() {
-        let parser_factory = Arc::new(ParserFactory::new());
-        let resolver = DependencyResolverServiceImpl::new(parser_factory);
+        let resolver = DependencyResolverServiceImpl::new();
 
         let root = Package::new(
             "root".to_string(),

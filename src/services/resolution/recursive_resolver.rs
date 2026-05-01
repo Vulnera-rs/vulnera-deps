@@ -5,12 +5,10 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::application::errors::{ApplicationError, VulnerabilityError};
-use vulnera_contract::domain::vulnerability::entities::Package;
-use vulnera_contract::domain::vulnerability::value_objects::{Ecosystem, Version};
-use vulnera_contract::application::vulnerability::services::CacheService;
-use vulnera_contract::infrastructure::registries::{
-    PackageRegistryClient, RegistryPackageMetadata,
-};
+use crate::domain::vulnerability::entities::Package;
+use crate::domain::vulnerability::value_objects::{Ecosystem, Version};
+use crate::infrastructure::registries::{PackageRegistryClient, RegistryPackageMetadata};
+use crate::services::cache::CacheService;
 
 use crate::domain::version_constraint::VersionConstraint;
 use crate::domain::{DependencyEdge, DependencyGraph, PackageId, PackageMetadata, PackageNode};
@@ -105,8 +103,8 @@ impl<C: CacheService> RecursiveResolver<C> {
             };
 
             for reg_dep in metadata.dependencies {
-                // Skip dev dependencies for transitive resolution
-                if reg_dep.is_dev {
+                // Skip dev and optional dependencies for transitive resolution
+                if reg_dep.is_dev || reg_dep.is_optional {
                     continue;
                 }
 

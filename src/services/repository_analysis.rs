@@ -7,13 +7,64 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::application::errors::ApplicationError;
-use vulnera_contract::Config;
-use vulnera_contract::domain::vulnerability::entities::{Package, Vulnerability};
-use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityRepository;
-use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
+use crate::config::DepsConfig;
+use crate::domain::vulnerability::entities::{Package, Vulnerability};
+use crate::domain::vulnerability::repositories::VulnerabilityRepository;
+use crate::domain::vulnerability::value_objects::Ecosystem;
+use crate::infrastructure::parsers::ParserFactory;
 
-use crate::parsers::ParserFactory;
-use vulnera_contract::infrastructure::repository_source::RepositorySourceClient;
+use thiserror::Error;
+
+#[derive(Debug, Clone)]
+pub struct RepositoryFile {
+    pub path: String,
+    pub size: u64,
+    pub sha: Option<String>,
+}
+
+pub struct FetchedFileContent {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Error, Debug, Clone)]
+pub enum RepositorySourceError {
+    #[error("Not found: {0}")]
+    NotFound(String),
+    #[error("Access denied: {0}")]
+    AccessDenied(String),
+    #[error("Rate limited: {message}")]
+    RateLimited {
+        message: String,
+        retry_after: Option<u64>,
+    },
+    #[error("Validation error: {0}")]
+    Validation(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+#[async_trait::async_trait]
+pub trait RepositorySourceClient: Send + Sync {
+    async fn list_repository_files(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: Option<&str>,
+        max_files: u32,
+        max_total_bytes: u64,
+    ) -> Result<Vec<RepositoryFile>, RepositorySourceError>;
+
+    async fn fetch_file_contents(
+        &self,
+        owner: &str,
+        repo: &str,
+        files: &[RepositoryFile],
+        reference: Option<&str>,
+        max_single_file_bytes: u64,
+        max_concurrent_fetches: usize,
+    ) -> Result<Vec<FetchedFileContent>, RepositorySourceError>;
+}
 
 /// Input for analyzing a repository (already validated & parsed from request/URL)
 #[derive(Debug, Clone)]
@@ -47,7 +98,7 @@ pub struct RepositoryAnalysisInternalResult {
     pub commit_sha: String,
     pub files: Vec<RepositoryFileResultInternal>,
     pub vulnerabilities: Vec<Vulnerability>,
-    pub severity_breakdown: vulnera_contract::domain::vulnerability::entities::SeverityBreakdown,
+    pub severity_breakdown: crate::domain::vulnerability::entities::SeverityBreakdown,
     pub total_files_scanned: u32,
     pub analyzed_files: u32,
     pub skipped_files: u32,
@@ -70,17 +121,17 @@ pub trait RepositoryAnalysisService: Send + Sync {
 /// Repository analysis service implementation
 pub struct RepositoryAnalysisServiceImpl<C: RepositorySourceClient> {
     source_client: Arc<C>,
-    vuln_repo: Option<Arc<dyn IVulnerabilityRepository>>,
+    vuln_repo: Option<Arc<dyn VulnerabilityRepository>>,
     parser_factory: Arc<ParserFactory>,
-    config: Arc<Config>,
+    config: Arc<DepsConfig>,
 }
 
 impl<C: RepositorySourceClient> RepositoryAnalysisServiceImpl<C> {
     pub fn new(
         source_client: Arc<C>,
-        vuln_repo: Option<Arc<dyn IVulnerabilityRepository>>,
+        vuln_repo: Option<Arc<dyn VulnerabilityRepository>>,
         parser_factory: Arc<ParserFactory>,
-        config: Arc<Config>,
+        config: Arc<DepsConfig>,
     ) -> Self {
         Self {
             source_client,
@@ -103,7 +154,7 @@ impl<C: RepositorySourceClient + 'static> RepositoryAnalysisService
         let start = std::time::Instant::now();
         let max_files = input
             .max_files
-            .min(self.config.apis.github.max_files_scanned as u32);
+            .min(self.config.apis.github.max_files_scanned);
         let files = self
             .source_client
             .list_repository_files(
@@ -115,21 +166,17 @@ impl<C: RepositorySourceClient + 'static> RepositoryAnalysisService
             )
             .await
             .map_err(|e| match e {
-                vulnera_contract::infrastructure::repository_source::RepositorySourceError::NotFound(_)
-                | vulnera_contract::infrastructure::repository_source::RepositorySourceError::AccessDenied(
-                    _,
-                ) => ApplicationError::NotFound {
-                    resource: "repository".to_string(),
-                    id: format!("{}/{}", &input.owner, &input.repo),
-                },
-                vulnera_contract::infrastructure::repository_source::RepositorySourceError::RateLimited {
-                    message,
-                    ..
-                } => ApplicationError::RateLimited { message },
-                vulnera_contract::infrastructure::repository_source::RepositorySourceError::Validation(
-                    msg,
-                ) => ApplicationError::Domain(
-                    vulnera_contract::domain::vulnerability::errors::VulnerabilityDomainError::InvalidInput {
+                RepositorySourceError::NotFound(_) | RepositorySourceError::AccessDenied(_) => {
+                    ApplicationError::NotFound {
+                        resource: "repository".to_string(),
+                        id: format!("{}/{}", &input.owner, &input.repo),
+                    }
+                }
+                RepositorySourceError::RateLimited { message, .. } => {
+                    ApplicationError::RateLimited { message }
+                }
+                RepositorySourceError::Validation(msg) => ApplicationError::Domain(
+                    crate::domain::vulnerability::errors::VulnerabilityDomainError::InvalidInput {
                         field: "ref".into(),
                         message: msg,
                     },
@@ -190,22 +237,22 @@ impl<C: RepositorySourceClient + 'static> RepositoryAnalysisService
                 )
                 .await
                 .map_err(|e| match e {
-                    vulnera_contract::infrastructure::repository_source::RepositorySourceError::RateLimited {
+                    RepositorySourceError::RateLimited {
                         ..
                     } => ApplicationError::RateLimited {
                         message: e.to_string(),
                     },
-                    vulnera_contract::infrastructure::repository_source::RepositorySourceError::NotFound(_)
-                    | vulnera_contract::infrastructure::repository_source::RepositorySourceError::AccessDenied(
+                    RepositorySourceError::NotFound(_)
+                    | RepositorySourceError::AccessDenied(
                         _,
                     ) => ApplicationError::NotFound {
                         resource: "file contents".into(),
                         id: format!("{}/{}", &input.owner, &input.repo),
                     },
-                    vulnera_contract::infrastructure::repository_source::RepositorySourceError::Validation(
+                    RepositorySourceError::Validation(
                         msg,
                     ) => ApplicationError::Domain(
-                        vulnera_contract::domain::vulnerability::errors::VulnerabilityDomainError::InvalidInput {
+                        crate::domain::vulnerability::errors::VulnerabilityDomainError::InvalidInput {
                             field: "ref".into(),
                             message: msg,
                         },
@@ -231,7 +278,7 @@ impl<C: RepositorySourceClient + 'static> RepositoryAnalysisService
             let ecosystem = self.parser_factory.detect_ecosystem(&file.path);
             if let Some(content) = content_map.get(&file.path) {
                 if let Some(parser) = self.parser_factory.create_parser(&file.path) {
-                    match parser.parse_file(content).await {
+                    match parser.parse(content) {
                         Ok(parse_result) => {
                             for p in &parse_result.packages {
                                 unique_packages
@@ -297,7 +344,7 @@ impl<C: RepositorySourceClient + 'static> RepositoryAnalysisService
         let mut seen = HashSet::new();
         all_vulns.retain(|v| seen.insert(v.id.as_str().to_string()));
         let severity_breakdown =
-            vulnera_contract::domain::vulnerability::entities::SeverityBreakdown::from_vulnerabilities(
+            crate::domain::vulnerability::entities::SeverityBreakdown::from_vulnerabilities(
                 &all_vulns,
             );
 
@@ -306,7 +353,13 @@ impl<C: RepositorySourceClient + 'static> RepositoryAnalysisService
             owner: input.owner.clone(),
             repo: input.repo.clone(),
             requested_ref: input.requested_ref.clone(),
-            commit_sha: input.requested_ref.clone().unwrap_or_default(),
+            // FIXME: commit_sha should be the resolved Git SHA, not the requested ref.
+            // The source client should return the resolved SHA; until that capability is
+            // added, store the requested ref with a best-effort note.
+            commit_sha: input
+                .requested_ref
+                .clone()
+                .unwrap_or_else(|| "HEAD".to_string()),
             files: parsed_files,
             vulnerabilities: all_vulns.clone(),
             severity_breakdown,

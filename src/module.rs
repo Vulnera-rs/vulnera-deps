@@ -5,39 +5,44 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use vulnera_contract::domain::vulnerability::repositories::IVulnerabilityRepository;
-use vulnera_contract::infrastructure::cache::CacheServiceImpl;
+use crate::services::cache::CacheBackendAdapter;
 
-use crate::parsers::ParserFactory;
+use crate::infrastructure::parsers::ParserFactory;
 
+use vulnera_advisor::{PackageRegistry, VulnerabilityManager};
 use vulnera_contract::domain::module::{
     AnalysisModule, Finding, FindingConfidence, FindingSeverity, FindingType, Location,
     ModuleConfig, ModuleExecutionError, ModuleResult, ModuleResultMetadata, ModuleType,
-    VulnerabilityFindingMetadata,
 };
+use vulnera_contract::infrastructure::cache::CacheBackend;
 
+use crate::application::events::NoOpEventEmitter;
 use crate::use_cases::AnalyzeDependenciesUseCase;
 
 /// Dependency analyzer module
 pub struct DependencyAnalyzerModule {
-    use_case: Arc<AnalyzeDependenciesUseCase<CacheServiceImpl>>,
+    use_case: Arc<AnalyzeDependenciesUseCase<CacheBackendAdapter>>,
     parser_factory: Arc<ParserFactory>,
 }
 
 impl DependencyAnalyzerModule {
     pub fn new(
         parser_factory: Arc<ParserFactory>,
-        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
-        cache_service: Arc<CacheServiceImpl>,
+        advisor: Arc<VulnerabilityManager>,
+        registry: Arc<PackageRegistry>,
+        cache_backend: Arc<dyn CacheBackend>,
         max_concurrent_requests: usize,
         max_concurrent_registry_queries: usize,
     ) -> Self {
+        let cache_service = Arc::new(CacheBackendAdapter::new(cache_backend));
         let use_case = Arc::new(AnalyzeDependenciesUseCase::new_with_config(
             parser_factory.clone(),
-            vulnerability_repository,
+            advisor,
+            registry,
             cache_service,
             max_concurrent_requests,
             max_concurrent_registry_queries,
+            Arc::new(NoOpEventEmitter::new()),
         ));
 
         Self {
@@ -49,19 +54,23 @@ impl DependencyAnalyzerModule {
     /// Create a new module with analysis context for workspace-aware analysis
     pub fn new_with_context(
         parser_factory: Arc<ParserFactory>,
-        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
-        cache_service: Arc<CacheServiceImpl>,
+        advisor: Arc<VulnerabilityManager>,
+        registry: Arc<PackageRegistry>,
+        cache_backend: Arc<dyn CacheBackend>,
         max_concurrent_requests: usize,
         max_concurrent_registry_queries: usize,
         project_root: Option<std::path::PathBuf>,
     ) -> Self {
+        let cache_service = Arc::new(CacheBackendAdapter::new(cache_backend));
         let use_case = Arc::new(AnalyzeDependenciesUseCase::new_with_context(
             parser_factory.clone(),
-            vulnerability_repository,
+            advisor,
+            registry,
             cache_service,
             max_concurrent_requests,
             max_concurrent_registry_queries,
             project_root,
+            Arc::new(NoOpEventEmitter::new()),
         ));
 
         Self {
@@ -131,24 +140,19 @@ impl AnalysisModule for DependencyAnalyzerModule {
             None => {
                 // No dependency file found - return empty result instead of failing
                 let duration = start_time.elapsed();
-                return Ok(ModuleResult {
-                    job_id: config.job_id,
-                    module_type: ModuleType::DependencyAnalyzer,
-                    findings: Vec::new(),
-                    metadata: ModuleResultMetadata {
-                        files_scanned: 0,
-                        duration_ms: duration.as_millis() as u64,
-                        additional_info: {
-                            let mut info = std::collections::HashMap::new();
-                            info.insert(
-                                "skip_reason".to_string(),
-                                "No dependency manifest files found in project".to_string(),
-                            );
-                            info
-                        },
-                    },
-                    error: None,
-                });
+                let mut meta = ModuleResultMetadata::default();
+                meta.files_scanned = 0;
+                meta.duration_ms = duration.as_millis() as u64;
+                meta.additional_info.insert(
+                    "skip_reason".to_string(),
+                    "No dependency manifest files found in project".to_string(),
+                );
+                return Ok(ModuleResult::success(
+                    config.job_id,
+                    ModuleType::DependencyAnalyzer,
+                    Vec::new(),
+                    meta,
+                ));
             }
         };
 
@@ -157,32 +161,25 @@ impl AnalysisModule for DependencyAnalyzerModule {
             None => {
                 // No ecosystem detected - return empty result instead of failing
                 let duration = start_time.elapsed();
-                return Ok(ModuleResult {
-                    job_id: config.job_id,
-                    module_type: ModuleType::DependencyAnalyzer,
-                    findings: Vec::new(),
-                    metadata: ModuleResultMetadata {
-                        files_scanned: 0,
-                        duration_ms: duration.as_millis() as u64,
-                        additional_info: {
-                            let mut info = std::collections::HashMap::new();
-                            info.insert(
-                                "skip_reason".to_string(),
-                                "Could not determine ecosystem for dependency file".to_string(),
-                            );
-                            info
-                        },
-                    },
-                    error: None,
-                });
+                let mut meta = ModuleResultMetadata::default();
+                meta.files_scanned = 0;
+                meta.duration_ms = duration.as_millis() as u64;
+                meta.additional_info.insert(
+                    "skip_reason".to_string(),
+                    "Could not determine ecosystem for dependency file".to_string(),
+                );
+                return Ok(ModuleResult::success(
+                    config.job_id,
+                    ModuleType::DependencyAnalyzer,
+                    Vec::new(),
+                    meta,
+                ));
             }
         };
 
         let ecosystem =
-            vulnera_contract::domain::vulnerability::value_objects::Ecosystem::from_str(
-                ecosystem_str,
-            )
-            .map_err(ModuleExecutionError::InvalidConfig)?;
+            crate::domain::vulnerability::value_objects::Ecosystem::from_str(ecosystem_str)
+                .map_err(ModuleExecutionError::InvalidConfig)?;
 
         let filename = config.config.get("filename").and_then(|v| v.as_str());
 
@@ -209,38 +206,22 @@ impl AnalysisModule for DependencyAnalyzerModule {
         let mut findings = Vec::new();
         for vuln in &analysis_report.vulnerabilities {
             for affected_pkg in &vuln.affected_packages {
-                let finding = Finding {
-                    id: format!("{}-{}", vuln.id.as_str(), affected_pkg.package.identifier()),
-                    r#type: FindingType::Vulnerability,
-                    rule_id: Some(vuln.id.as_str().to_string()),
-                    location: Location {
-                        path: format!(
-                            "{}:{}",
-                            affected_pkg.package.ecosystem.canonical_name(),
-                            affected_pkg.package.name
-                        ),
-                        line: None,
-                        column: None,
-                        end_line: None,
-                        end_column: None,
-                    },
-                    severity: match vuln.severity {
-                        vulnera_contract::domain::vulnerability::value_objects::Severity::Critical => {
+                let finding = {
+                    let severity = match vuln.severity {
+                        crate::domain::vulnerability::value_objects::Severity::Critical => {
                             FindingSeverity::Critical
                         }
-                        vulnera_contract::domain::vulnerability::value_objects::Severity::High => {
+                        crate::domain::vulnerability::value_objects::Severity::High => {
                             FindingSeverity::High
                         }
-                        vulnera_contract::domain::vulnerability::value_objects::Severity::Medium => {
+                        crate::domain::vulnerability::value_objects::Severity::Medium => {
                             FindingSeverity::Medium
                         }
-                        vulnera_contract::domain::vulnerability::value_objects::Severity::Low => {
+                        crate::domain::vulnerability::value_objects::Severity::Low => {
                             FindingSeverity::Low
                         }
-                    },
-                    confidence: FindingConfidence::High,
-                    description: vuln.description.clone(),
-                    recommendation: {
+                    };
+                    let recommendation = {
                         let current_version = &affected_pkg.package.version;
                         let latest_safe = affected_pkg.recommended_fix();
                         let nearest_safe = affected_pkg
@@ -258,10 +239,24 @@ impl AnalysisModule for DependencyAnalyzerModule {
                         } else {
                             None
                         }
-                    },
-                    secret_metadata: None,
-                    vulnerability_metadata: VulnerabilityFindingMetadata::default(),
-                    enrichment: None,
+                    };
+                    let mut b = Finding::builder(
+                        format!("{}-{}", vuln.id.as_str(), affected_pkg.package.identifier()),
+                        FindingType::Vulnerability,
+                        Location::new(format!(
+                            "{}:{}",
+                            affected_pkg.package.ecosystem.canonical_name(),
+                            affected_pkg.package.name
+                        )),
+                        severity,
+                        FindingConfidence::High,
+                        vuln.description.clone(),
+                    )
+                    .rule_id(vuln.id.as_str().to_string());
+                    if let Some(ref rec) = recommendation {
+                        b = b.recommendation(rec);
+                    }
+                    b.build()
                 };
                 findings.push(finding);
             }
@@ -269,25 +264,22 @@ impl AnalysisModule for DependencyAnalyzerModule {
 
         let duration = start_time.elapsed();
 
-        Ok(ModuleResult {
-            job_id: config.job_id,
-            module_type: ModuleType::DependencyAnalyzer,
+        let mut meta = ModuleResultMetadata::default();
+        meta.files_scanned = analysis_report.packages.len();
+        meta.duration_ms = duration.as_millis() as u64;
+        meta.additional_info.insert(
+            "total_packages".to_string(),
+            analysis_report.packages.len().to_string(),
+        );
+        meta.additional_info.insert(
+            "total_vulnerabilities".to_string(),
+            analysis_report.vulnerabilities.len().to_string(),
+        );
+        Ok(ModuleResult::success(
+            config.job_id,
+            ModuleType::DependencyAnalyzer,
             findings,
-            metadata: ModuleResultMetadata {
-                files_scanned: analysis_report.packages.len(),
-                duration_ms: duration.as_millis() as u64,
-                additional_info: std::collections::HashMap::from([
-                    (
-                        "total_packages".to_string(),
-                        analysis_report.packages.len().to_string(),
-                    ),
-                    (
-                        "total_vulnerabilities".to_string(),
-                        analysis_report.vulnerabilities.len().to_string(),
-                    ),
-                ]),
-            },
-            error: None,
-        })
+            meta,
+        ))
     }
 }

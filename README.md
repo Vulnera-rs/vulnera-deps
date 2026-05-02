@@ -18,7 +18,7 @@ Cross-ecosystem dependency resolution and CVE detection:
 | npm/Node | package.json | package-lock.json, yarn.lock, pnpm-lock.yaml |
 | Python | requirements.txt, Pipfile, pyproject.toml | poetry.lock, Pipfile.lock |
 | Rust | Cargo.toml | Cargo.lock |
-| Java | pom.xml, build.gradle | - |
+| Java | pom.xml, build.gradle , kotlin.xml | - |
 | Go | go.mod | go.sum |
 | Ruby | Gemfile | Gemfile.lock |
 | PHP | composer.json | composer.lock |

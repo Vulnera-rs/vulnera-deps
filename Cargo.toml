@@ -5,14 +5,15 @@ edition = "2024"
 rust-version = "1.92"
 authors = ["Vulnera-Team"]
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/Vulnera-rs/vulnera"
+repository = "https://github.com/Vulnera-rs/vulnera-deps"
 keywords = ["security", "vulnerability", "analysis", "dependencies"]
 categories = ["web-programming", "development-tools"]
 
 [dependencies]
-vulnera-contract = { package = "vulnera-contract", git = "https://github.com/Vulnera-rs/vulnera.git" }
+vulnera-contract = { path = "../vulnera-contract" }
+vulnera-infrastructure = { path = "../vulnera-infrastructure" }
 # Async runtime
-tokio = { version = "1.51", features = ["full"] }
+tokio = { version = "1.51", features = ["rt", "sync", "fs", "macros"] }
 async-trait = "0.1.89"
 # Logging
 tracing = "0.1.44"
@@ -27,19 +28,19 @@ uuid = { version = "1.20.0", features = ["v4", "serde"] }
 chrono = { version = "0.4.43", features = ["serde"] }
 # Version parsing
 semver = { version = "1.0", features = ["serde"] }
-toml = "0.9.8"
-serde_yml = "0.0.12"
+toml = "1.1"
 quick-xml = { version = "0.39.0", features = ["serialize"] }
 regex = "1.12"
-once_cell = "1.21"
-base64 = "0.22"
-percent-encoding = "2.3"
-petgraph = "0.8.3"
 globset = "0.4"
+pep508_rs = "0.9"
+tree-sitter = "0.26"
+tree-sitter-kotlin-sqry = "11"
+tree-sitter-groovy-sqry = "11"
+# Advisor
+vulnera-advisor = "0.1.7"
+petgraph = "0.8.3"
 [dev-dependencies]
 tokio-test = "0.4.5"
 proptest = "1.9"
-criterion = { version = "0.8.1", features = ["html_reports", "async_tokio"] }
 rstest = "0.26.1"
 tempfile = "3.25.0"
-futures = "0.3.31"

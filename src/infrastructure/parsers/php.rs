@@ -1,14 +1,14 @@
 //! PHP ecosystem parsers
 
-use super::traits::{PackageFileParser, ParseResult};
-use crate::application::errors::ParseError;
-use async_trait::async_trait;
-use serde_json::Value;
-use std::collections::HashMap;
-use vulnera_contract::domain::vulnerability::{
+use super::traits::{FilePattern, PackageFileParser, ParseResult, SourceType};
+use super::version_extractor;
+use crate::domain::errors::ParseError;
+use crate::domain::vulnerability::{
     entities::{Dependency, Package},
     value_objects::{Ecosystem, Version},
 };
+use serde_json::Value;
+use std::collections::HashMap;
 
 /// Parser for composer.json files
 pub struct ComposerParser;
@@ -48,12 +48,10 @@ impl ComposerParser {
                             field: format!("version for package {}", name),
                         })?;
 
-                // Clean version string
-                let clean_version = self.clean_composer_version(version_str)?;
-
-                let version = Version::parse(&clean_version).map_err(|_| ParseError::Version {
-                    version: version_str.to_string(),
-                })?;
+                let result = version_extractor::composer(version_str)?;
+                let Some((_cleaned, version)) = result else {
+                    continue;
+                };
 
                 let package = Package::new(name.clone(), version, Ecosystem::Packagist)
                     .map_err(|e| ParseError::MissingField { field: e })?;
@@ -73,67 +71,13 @@ impl ComposerParser {
         Ok(ParseResult {
             packages,
             dependencies,
+            source_type: SourceType::Manifest,
         })
-    }
-
-    /// Clean Composer version string
-    fn clean_composer_version(&self, version_str: &str) -> Result<String, ParseError> {
-        let version_str = version_str.trim();
-
-        if version_str.is_empty() || version_str == "*" {
-            return Ok("0.0.0".to_string());
-        }
-
-        // Remove common Composer prefixes
-        let cleaned = if version_str.starts_with('^') || version_str.starts_with('~') {
-            &version_str[1..]
-        } else if version_str.starts_with(">=") || version_str.starts_with("<=") {
-            &version_str[2..]
-        } else if version_str.starts_with('>') || version_str.starts_with('<') {
-            &version_str[1..]
-        } else {
-            version_str
-        };
-
-        // Handle version ranges (take the first version)
-        let cleaned = if let Some(pipe_pos) = cleaned.find('|') {
-            &cleaned[..pipe_pos]
-        } else if let Some(comma_pos) = cleaned.find(',') {
-            &cleaned[..comma_pos]
-        } else {
-            cleaned
-        };
-
-        // Handle stability flags (remove -dev, -alpha, etc.)
-        let cleaned = if let Some(dash_pos) = cleaned.find('-') {
-            let base_part = &cleaned[..dash_pos];
-            // Only keep the base if it looks like a version
-            if base_part.matches('.').count() >= 1 {
-                base_part
-            } else {
-                cleaned
-            }
-        } else {
-            cleaned
-        };
-
-        let cleaned = cleaned.trim();
-
-        if cleaned.is_empty() {
-            Ok("0.0.0".to_string())
-        } else {
-            Ok(cleaned.to_string())
-        }
     }
 }
 
-#[async_trait]
 impl PackageFileParser for ComposerParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        filename == "composer.json"
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         let json: Value = serde_json::from_str(content)?;
         let mut result = ParseResult::default();
 
@@ -161,6 +105,7 @@ impl PackageFileParser for ComposerParser {
         result.packages.extend(dev_deps.packages);
         result.dependencies.extend(dev_deps.dependencies);
 
+        result.source_type = SourceType::Manifest;
         Ok(result)
     }
 
@@ -168,8 +113,8 @@ impl PackageFileParser for ComposerParser {
         Ecosystem::Packagist
     }
 
-    fn priority(&self) -> u8 {
-        10 // High priority for composer.json
+    fn patterns(&self) -> &[FilePattern] {
+        &[FilePattern::Name("composer.json")]
     }
 }
 
@@ -188,26 +133,10 @@ impl ComposerLockParser {
     }
 
     fn infer_dependency_version(requirement: &str) -> Option<Version> {
-        let req = requirement.trim();
-        if req.is_empty() || req == "*" {
-            return None;
+        match version_extractor::composer(requirement) {
+            Ok(Some((_, version))) => Some(version),
+            _ => None,
         }
-
-        let cleaned = req
-            .trim_start_matches('^')
-            .trim_start_matches('~')
-            .trim_start_matches("<=")
-            .trim_start_matches(">=")
-            .trim_start_matches('<')
-            .trim_start_matches('>')
-            .trim_start_matches('=')
-            .split(['|', ','])
-            .next()
-            .unwrap_or(req)
-            .trim();
-
-        let cleaned = cleaned.strip_prefix('v').unwrap_or(cleaned);
-        Version::parse(cleaned).ok()
     }
 
     /// Extract packages and dependencies from composer.lock
@@ -233,15 +162,11 @@ impl ComposerLockParser {
                             field: "package version".to_string(),
                         })?;
 
-                    let clean_version = if let Some(stripped) = version_str.strip_prefix('v') {
-                        stripped
-                    } else {
-                        version_str
-                    };
-
                     let version =
-                        Version::parse(clean_version).map_err(|_| ParseError::Version {
-                            version: version_str.to_string(),
+                        version_extractor::composer_locked(version_str)?.ok_or_else(|| {
+                            ParseError::Version {
+                                version: version_str.to_string(),
+                            }
                         })?;
 
                     let package = Package::new(name.to_string(), version, Ecosystem::Packagist)
@@ -303,17 +228,13 @@ impl ComposerLockParser {
         Ok(ParseResult {
             packages,
             dependencies,
+            source_type: SourceType::Manifest,
         })
     }
 }
 
-#[async_trait]
 impl PackageFileParser for ComposerLockParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        filename == "composer.lock"
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         let json: Value = serde_json::from_str(content)?;
         let mut packages = Vec::new();
         let mut dependencies = Vec::new();
@@ -331,6 +252,7 @@ impl PackageFileParser for ComposerLockParser {
         Ok(ParseResult {
             packages,
             dependencies,
+            source_type: SourceType::LockFile,
         })
     }
 
@@ -338,8 +260,8 @@ impl PackageFileParser for ComposerLockParser {
         Ecosystem::Packagist
     }
 
-    fn priority(&self) -> u8 {
-        15 // Higher priority than composer.json for exact versions
+    fn patterns(&self) -> &[FilePattern] {
+        &[FilePattern::Name("composer.lock")]
     }
 }
 
@@ -347,8 +269,8 @@ impl PackageFileParser for ComposerLockParser {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_composer_json_parser() {
+    #[test]
+    fn test_composer_json_parser() {
         let parser = ComposerParser::new();
         let content = r#"
         {
@@ -366,8 +288,8 @@ mod tests {
         }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
-        assert_eq!(result.packages.len(), 5); // Excluding php version
+        let result = parser.parse(content).unwrap();
+        assert_eq!(result.packages.len(), 4); // Excluding php and wildcard
 
         let symfony_pkg = result
             .packages
@@ -385,8 +307,8 @@ mod tests {
         assert_eq!(guzzle_pkg.version, Version::parse("7.0").unwrap());
     }
 
-    #[tokio::test]
-    async fn test_composer_lock_parser() {
+    #[test]
+    fn test_composer_lock_parser() {
         let parser = ComposerLockParser::new();
         let content = r#"
         {
@@ -432,7 +354,7 @@ mod tests {
         }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 3);
 
         let symfony_pkg = result
@@ -465,26 +387,17 @@ mod tests {
     }
 
     #[test]
-    fn test_clean_composer_version() {
-        let parser = ComposerParser::new();
-
-        assert_eq!(parser.clean_composer_version("^5.4").unwrap(), "5.4");
-        assert_eq!(parser.clean_composer_version("~7.0").unwrap(), "7.0");
-        assert_eq!(parser.clean_composer_version(">=2.0").unwrap(), "2.0");
-        assert_eq!(parser.clean_composer_version("*").unwrap(), "0.0.0");
-        assert_eq!(parser.clean_composer_version("5.4|6.0").unwrap(), "5.4");
-        assert_eq!(parser.clean_composer_version("2.5.0-dev").unwrap(), "2.5.0");
-    }
-
-    #[test]
-    fn test_parser_supports_file() {
+    fn test_parser_patterns() {
         let composer_parser = ComposerParser::new();
         let lock_parser = ComposerLockParser::new();
 
-        assert!(composer_parser.supports_file("composer.json"));
-        assert!(!composer_parser.supports_file("composer.lock"));
-
-        assert!(lock_parser.supports_file("composer.lock"));
-        assert!(!lock_parser.supports_file("composer.json"));
+        assert_eq!(
+            composer_parser.patterns(),
+            &[FilePattern::Name("composer.json")]
+        );
+        assert_eq!(
+            lock_parser.patterns(),
+            &[FilePattern::Name("composer.lock")]
+        );
     }
 }

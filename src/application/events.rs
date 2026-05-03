@@ -3,9 +3,9 @@
 //! This module provides an event system for real-time updates during dependency analysis,
 //! enabling IDE extensions and CLI tools to receive progress updates and results.
 
+use crate::domain::vulnerability::entities::{Package, Vulnerability};
 use async_trait::async_trait;
 use std::sync::Arc;
-use vulnera_contract::domain::vulnerability::entities::{Package, Vulnerability};
 
 use crate::domain::{PackageId, SourceLocation};
 
@@ -166,9 +166,8 @@ mod tests {
         let emitter = VecEventEmitter::new();
         let package = Package::new(
             "test".to_string(),
-            vulnera_contract::domain::vulnerability::value_objects::Version::parse("1.0.0")
-                .unwrap(),
-            vulnera_contract::domain::vulnerability::value_objects::Ecosystem::Npm,
+            crate::domain::vulnerability::value_objects::Version::parse("1.0.0").unwrap(),
+            crate::domain::vulnerability::value_objects::Ecosystem::Npm,
         )
         .unwrap();
 

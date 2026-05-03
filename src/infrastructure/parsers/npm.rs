@@ -1,35 +1,13 @@
 //! Node.js ecosystem parsers
 
-use super::traits::{PackageFileParser, ParseResult};
-use crate::application::errors::ParseError;
-use async_trait::async_trait;
-use serde_json::Value;
-use vulnera_contract::domain::vulnerability::{
+use super::traits::{FilePattern, PackageFileParser, ParseResult, SourceType};
+use super::version_extractor;
+use crate::domain::errors::ParseError;
+use crate::domain::vulnerability::{
     entities::{Dependency, Package},
     value_objects::{Ecosystem, Version},
 };
-
-/// Check if a version string is a URL-based or non-semver dependency that cannot be scanned.
-fn is_non_semver_version(version_str: &str) -> bool {
-    let v = version_str.trim();
-    v.starts_with("git+")
-        || v.starts_with("git://")
-        || v.starts_with("http://")
-        || v.starts_with("https://")
-        || v.starts_with("file:")
-        || v.starts_with("link:")
-        || v.starts_with("workspace:")
-        || v.starts_with("npm:")
-        || v.starts_with("github:")
-        || v.starts_with("gitlab:")
-        || v.starts_with("bitbucket:")
-        || v.contains("://") // catch-all for URLs
-        || (v.contains('/') && v.contains('#')) // github shorthand: user/repo#ref
-        || v == "."
-        || v == ".."
-        || v.starts_with("./")
-        || v.starts_with("../")
-}
+use serde_json::Value;
 
 /// Parser for package.json files
 pub struct NpmParser;
@@ -79,18 +57,11 @@ impl NpmParser {
                             field: format!("version for package {}", name),
                         })?;
 
-                // Skip non-semver dependencies (git, tarball, path, file URLs, workspace refs, etc.)
-                // These are valid npm specifiers but not scannable for vulnerabilities
-                if is_non_semver_version(version_str) {
-                    continue;
-                }
-
-                // Clean version string (remove npm-specific prefixes like ^, ~, >=, etc.)
-                let clean_version = self.clean_version_string(version_str)?;
-
-                let version = Version::parse(&clean_version).map_err(|_| ParseError::Version {
-                    version: version_str.to_string(),
-                })?;
+                let (_, version) = match version_extractor::npm(version_str) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => continue,
+                    Err(e) => return Err(e),
+                };
 
                 let package = Package::new(name.clone(), version, Ecosystem::Npm)
                     .map_err(|e| ParseError::MissingField { field: e })?;
@@ -98,88 +69,31 @@ impl NpmParser {
                 packages.push(package.clone());
 
                 // Extract dependency relationship from the manifest root
-                dependencies.push(
-                    vulnera_contract::domain::vulnerability::entities::Dependency::new(
-                        root_pkg.clone(),
-                        package,
-                        version_str.to_string(),
-                        false, // Direct dependency
-                    ),
-                );
+                dependencies.push(crate::domain::vulnerability::entities::Dependency::new(
+                    root_pkg.clone(),
+                    package,
+                    version_str.to_string(),
+                    false, // Direct dependency
+                ));
             }
         }
 
         Ok(ParseResult {
             packages,
             dependencies,
+            source_type: SourceType::Manifest,
         })
-    }
-
-    /// Clean npm version string by removing prefixes and ranges
-    fn clean_version_string(&self, version_str: &str) -> Result<String, ParseError> {
-        let version_str = version_str.trim();
-
-        // Handle common npm version patterns
-        if version_str.is_empty() {
-            return Err(ParseError::Version {
-                version: version_str.to_string(),
-            });
-        }
-
-        // Handle special cases
-        if version_str == "*" || version_str == "latest" {
-            return Ok("0.0.0".to_string());
-        }
-
-        // Remove common prefixes
-        let cleaned = if version_str.starts_with('^') || version_str.starts_with('~') {
-            &version_str[1..]
-        } else if version_str.starts_with(">=") || version_str.starts_with("<=") {
-            &version_str[2..]
-        } else if version_str.starts_with('>')
-            || version_str.starts_with('<')
-            || version_str.starts_with('=')
-        {
-            &version_str[1..]
-        } else {
-            version_str
-        };
-
-        // Handle version ranges (take the first version)
-        let cleaned = if let Some(space_pos) = cleaned.find(' ') {
-            &cleaned[..space_pos]
-        } else {
-            cleaned
-        };
-
-        // Handle OR conditions (take the first version)
-        let cleaned = if let Some(or_pos) = cleaned.find("||") {
-            &cleaned[..or_pos]
-        } else {
-            cleaned
-        };
-
-        let cleaned = cleaned.trim();
-
-        if cleaned.is_empty() {
-            return Err(ParseError::Version {
-                version: version_str.to_string(),
-            });
-        }
-
-        Ok(cleaned.to_string())
     }
 }
 
-#[async_trait]
 impl PackageFileParser for NpmParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        filename == "package.json"
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         let json: Value = serde_json::from_str(content)?;
-        let mut result = ParseResult::default();
+        let mut result = ParseResult {
+            packages: Vec::new(),
+            dependencies: Vec::new(),
+            source_type: SourceType::Manifest,
+        };
 
         // Extract different types of dependencies
         let deps = self.extract_dependencies(&json, "dependencies")?;
@@ -205,12 +119,13 @@ impl PackageFileParser for NpmParser {
         Ecosystem::Npm
     }
 
-    fn priority(&self) -> u8 {
-        10 // High priority for package.json
+    fn patterns(&self) -> &[FilePattern] {
+        &[FilePattern::Name("package.json")]
     }
 }
 
 /// Parser for package-lock.json files
+// bun/deno support TODO!
 pub struct PackageLockParser;
 
 impl Default for PackageLockParser {
@@ -267,15 +182,11 @@ impl PackageLockParser {
         if let Some(deps_obj) = deps.as_object() {
             for (key, dep_info) in deps_obj {
                 if let Some(version_str) = dep_info.get("version").and_then(|v| v.as_str()) {
-                    // Skip non-semver dependencies (git, tarball, path, file URLs, workspace refs, etc.)
-                    // These are valid npm specifiers but not scannable for vulnerabilities
-                    if is_non_semver_version(version_str) {
-                        continue;
-                    }
-
-                    let version = Version::parse(version_str).map_err(|_| ParseError::Version {
-                        version: version_str.to_string(),
-                    })?;
+                    let version = match version_extractor::npm_locked(version_str) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => continue,
+                        Err(e) => return Err(e),
+                    };
 
                     // Extract the actual package name based on the lockfile format
                     let name = if is_packages_section {
@@ -339,6 +250,7 @@ impl PackageLockParser {
         Ok(ParseResult {
             packages,
             dependencies,
+            source_type: SourceType::LockFile,
         })
     }
 
@@ -388,15 +300,14 @@ impl PackageLockParser {
     }
 }
 
-#[async_trait]
 impl PackageFileParser for PackageLockParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        filename == "package-lock.json"
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         let json: Value = serde_json::from_str(content)?;
-        let mut result = ParseResult::default();
+        let mut result = ParseResult {
+            packages: Vec::new(),
+            dependencies: Vec::new(),
+            source_type: SourceType::LockFile,
+        };
 
         // Extract from dependencies section (v1 lockfiles)
         if let Some(deps) = json.get("dependencies") {
@@ -419,8 +330,8 @@ impl PackageFileParser for PackageLockParser {
         Ecosystem::Npm
     }
 
-    fn priority(&self) -> u8 {
-        15 // Higher priority than package.json for exact versions
+    fn patterns(&self) -> &[FilePattern] {
+        &[FilePattern::Name("package-lock.json")]
     }
 }
 
@@ -438,114 +349,48 @@ impl YarnLockParser {
         Self
     }
 
-    /// Parse yarn.lock format which is a custom format
+    /// Parse yarn.lock format which is a custom format, using a state machine.
     fn parse_yarn_lock(&self, content: &str) -> Result<ParseResult, ParseError> {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum YarnState {
+            Top,
+            Entry,
+            Dependencies,
+        }
+
         let mut packages = Vec::new();
         let mut dependencies = Vec::new();
         let mut pending_dependencies: Vec<(Package, String, String)> = Vec::new();
 
+        let mut state = YarnState::Top;
         let mut current_package_names: Vec<String> = Vec::new();
         let mut current_version: Option<String> = None;
         let mut current_dependencies: Vec<(String, String)> = Vec::new();
-        let mut in_dependencies = false;
 
-        for line in content.lines() {
-            let line_trim = line.trim();
-
-            // Skip comments and empty lines
-            if line_trim.is_empty() || line_trim.starts_with('#') {
-                continue;
-            }
-
-            // Indentation check
-            let indent = line.len() - line.trim_start().len();
-
-            if indent == 0 {
-                // New entry
-                // Save previous
-                if let Some(version) = &current_version
-                    && let Ok(parsed_version) = Version::parse(version)
-                {
-                    for name in &current_package_names {
-                        // Name might be "pkg@range", extract just name
-                        let pkg_name = if let Some(at_pos) = name.rfind('@') {
-                            if at_pos > 0 { &name[..at_pos] } else { name }
-                        } else {
-                            name
-                        };
-
-                        if let Ok(package) = Package::new(
-                            pkg_name.to_string(),
-                            parsed_version.clone(),
-                            Ecosystem::Npm,
-                        ) {
-                            packages.push(package.clone());
-
-                            // Add dependencies
-                            for (dep_name, dep_req) in &current_dependencies {
-                                pending_dependencies.push((
-                                    package.clone(),
-                                    dep_name.clone(),
-                                    dep_req.clone(),
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                // Reset
-                current_package_names.clear();
-                current_version = None;
-                current_dependencies.clear();
-                in_dependencies = false;
-
-                // Parse names (comma separated)
-                // "pkg-a@^1.0.0, pkg-a@^1.1.0:"
-                let line_no_colon = line_trim.trim_end_matches(':');
-                for part in line_no_colon.split(',') {
-                    let part = part.trim();
-                    let part = part.trim_matches('"');
-                    current_package_names.push(part.to_string());
-                }
-            } else if indent == 2 {
-                if line_trim.starts_with("version ") {
-                    let version_str = line_trim
-                        .trim_start_matches("version ")
-                        .trim()
-                        .trim_matches('"');
-                    current_version = Some(version_str.to_string());
-                    in_dependencies = false;
-                } else if line_trim.starts_with("dependencies:") {
-                    in_dependencies = true;
-                } else if in_dependencies {
-                    // Dependency entry: "dep-name" "range"
-                    // or "dep-name" "range"
-                    // split by space
-                    if let Some(space_pos) = line_trim.find(' ') {
-                        let name = line_trim[..space_pos].trim_matches('"');
-                        let req = line_trim[space_pos..].trim().trim_matches('"');
-                        current_dependencies.push((name.to_string(), req.to_string()));
-                    }
-                }
-            }
-        }
-
-        // Save last
-        if let Some(version) = &current_version
-            && let Ok(parsed_version) = Version::parse(version)
-        {
-            for name in &current_package_names {
-                let pkg_name = if let Some(at_pos) = name.rfind('@') {
-                    if at_pos > 0 { &name[..at_pos] } else { name }
-                } else {
-                    name
-                };
-
+        fn save_entry(
+            packages: &mut Vec<Package>,
+            pending_dependencies: &mut Vec<(Package, String, String)>,
+            current_package_names: &[String],
+            current_version: &Option<String>,
+            current_dependencies: &[(String, String)],
+        ) {
+            let Some(version_str) = current_version else {
+                return;
+            };
+            let Ok(Some(parsed_version)) = version_extractor::npm_locked(version_str) else {
+                return;
+            };
+            for name in current_package_names {
+                let pkg_name = name
+                    .rsplit_once('@')
+                    .filter(|(prefix, _)| !prefix.is_empty())
+                    .map(|(n, _)| n)
+                    .unwrap_or(name);
                 if let Ok(package) =
                     Package::new(pkg_name.to_string(), parsed_version.clone(), Ecosystem::Npm)
                 {
                     packages.push(package.clone());
-                    for (dep_name, dep_req) in &current_dependencies {
+                    for (dep_name, dep_req) in current_dependencies {
                         pending_dependencies.push((
                             package.clone(),
                             dep_name.clone(),
@@ -555,6 +400,138 @@ impl YarnLockParser {
                 }
             }
         }
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+
+            // Skip comments and empty lines.
+            // Blank lines flush the current entry to avoid data loss.
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                if !matches!(state, YarnState::Top) {
+                    save_entry(
+                        &mut packages,
+                        &mut pending_dependencies,
+                        &current_package_names,
+                        &current_version,
+                        &current_dependencies,
+                    );
+                    state = YarnState::Top;
+                    current_package_names.clear();
+                    current_version = None;
+                    current_dependencies.clear();
+                }
+                continue;
+            }
+
+            let indent = line.len() - line.trim_start().len();
+
+            match state {
+                YarnState::Top => {
+                    if indent == 0 && trimmed.ends_with(':') {
+                        // New entry header
+                        let line_no_colon = trimmed.trim_end_matches(':');
+                        for part in line_no_colon.split(',') {
+                            let part = part.trim().trim_matches('"');
+                            if !part.is_empty() {
+                                current_package_names.push(part.to_string());
+                            }
+                        }
+                        state = YarnState::Entry;
+                    } else if indent == 0
+                        && !trimmed.ends_with(':')
+                        && trimmed.trim_matches('"').contains('@')
+                    {
+                        // Continuation of a previous entry header on next line
+                        current_package_names.push(trimmed.trim_matches('"').to_string());
+                    }
+                }
+                YarnState::Entry => {
+                    if indent == 0 {
+                        // New entry starting — save previous
+                        save_entry(
+                            &mut packages,
+                            &mut pending_dependencies,
+                            &current_package_names,
+                            &current_version,
+                            &current_dependencies,
+                        );
+                        current_package_names.clear();
+                        current_version = None;
+                        current_dependencies.clear();
+
+                        if trimmed.ends_with(':') {
+                            let line_no_colon = trimmed.trim_end_matches(':');
+                            for part in line_no_colon.split(',') {
+                                let part = part.trim().trim_matches('"');
+                                if !part.is_empty() {
+                                    current_package_names.push(part.to_string());
+                                }
+                            }
+                            state = YarnState::Entry;
+                        } else {
+                            state = YarnState::Top;
+                        }
+                    } else if indent == 2 {
+                        if let Some(rest) = trimmed.strip_prefix("version ") {
+                            let version_str = rest.trim().trim_matches('"');
+                            current_version = Some(version_str.to_string());
+                        } else if trimmed.ends_with("dependencies:") {
+                            state = YarnState::Dependencies;
+                        }
+                    }
+                }
+                YarnState::Dependencies => {
+                    if indent == 0 {
+                        // New entry starting — save previous
+                        save_entry(
+                            &mut packages,
+                            &mut pending_dependencies,
+                            &current_package_names,
+                            &current_version,
+                            &current_dependencies,
+                        );
+                        current_package_names.clear();
+                        current_version = None;
+                        current_dependencies.clear();
+
+                        if trimmed.ends_with(':') {
+                            let line_no_colon = trimmed.trim_end_matches(':');
+                            for part in line_no_colon.split(',') {
+                                let part = part.trim().trim_matches('"');
+                                if !part.is_empty() {
+                                    current_package_names.push(part.to_string());
+                                }
+                            }
+                            state = YarnState::Entry;
+                        } else {
+                            state = YarnState::Top;
+                        }
+                    } else if indent >= 4 {
+                        // Dependency entry: "dep-name" "range"
+                        if let Some(space_pos) = trimmed.find(' ') {
+                            let dep_name = trimmed[..space_pos].trim_matches('"');
+                            let dep_req = trimmed[space_pos..].trim().trim_matches('"');
+                            // Validate with version_extractor, skip non-scannable requirements
+                            if version_extractor::npm(dep_req)?.is_some() {
+                                current_dependencies
+                                    .push((dep_name.to_string(), dep_req.to_string()));
+                            }
+                        }
+                    } else if indent == 2 && trimmed.ends_with("dependencies:") {
+                        // Stay in dependencies mode for *dependencies: blocks
+                    }
+                }
+            }
+        }
+
+        // Save last entry
+        save_entry(
+            &mut packages,
+            &mut pending_dependencies,
+            &current_package_names,
+            &current_version,
+            &current_dependencies,
+        );
 
         for (from, dep_name, dep_req) in pending_dependencies {
             if let Some(target) =
@@ -567,17 +544,13 @@ impl YarnLockParser {
         Ok(ParseResult {
             packages,
             dependencies,
+            source_type: SourceType::LockFile,
         })
     }
 }
 
-#[async_trait]
 impl PackageFileParser for YarnLockParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        filename == "yarn.lock"
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         self.parse_yarn_lock(content)
     }
 
@@ -585,8 +558,8 @@ impl PackageFileParser for YarnLockParser {
         Ecosystem::Npm
     }
 
-    fn priority(&self) -> u8 {
-        12 // Medium-high priority for yarn.lock
+    fn patterns(&self) -> &[FilePattern] {
+        &[FilePattern::Name("yarn.lock")]
     }
 }
 
@@ -595,54 +568,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_non_semver_version() {
-        // URL-based versions should be detected
-        assert!(is_non_semver_version(
-            "https://github.com/user/repo/tarball/master"
-        ));
-        assert!(is_non_semver_version("http://example.com/package.tgz"));
-        assert!(is_non_semver_version(
-            "git+https://github.com/user/repo.git"
-        ));
-        assert!(is_non_semver_version("git://github.com/user/repo.git"));
-        assert!(is_non_semver_version(
-            "git+ssh://git@github.com/user/repo.git"
-        ));
-
-        // File/path references should be detected
-        assert!(is_non_semver_version("file:../local-package"));
-        assert!(is_non_semver_version("file:./local-package"));
-        assert!(is_non_semver_version("./local-package"));
-        assert!(is_non_semver_version("../local-package"));
-        assert!(is_non_semver_version("."));
-        assert!(is_non_semver_version(".."));
-
-        // Workspace/link references should be detected
-        assert!(is_non_semver_version("workspace:*"));
-        assert!(is_non_semver_version("workspace:^"));
-        assert!(is_non_semver_version("link:./packages/pkg"));
-
-        // npm aliases should be detected
-        assert!(is_non_semver_version("npm:actual-package@1.0.0"));
-
-        // GitHub/GitLab/Bitbucket shorthand should be detected
-        assert!(is_non_semver_version("github:user/repo"));
-        assert!(is_non_semver_version("gitlab:user/repo"));
-        assert!(is_non_semver_version("bitbucket:user/repo"));
-        assert!(is_non_semver_version("user/repo#branch")); // GitHub shorthand with ref
-
-        // Valid semver versions should NOT be detected as non-semver
-        assert!(!is_non_semver_version("1.0.0"));
-        assert!(!is_non_semver_version("^1.0.0"));
-        assert!(!is_non_semver_version("~1.0.0"));
-        assert!(!is_non_semver_version(">=1.0.0"));
-        assert!(!is_non_semver_version("1.0.0-alpha.1"));
-        assert!(!is_non_semver_version("*"));
-        assert!(!is_non_semver_version("latest"));
-    }
-
-    #[tokio::test]
-    async fn test_npm_parser_skips_url_dependencies() {
+    fn test_npm_parser_skips_url_dependencies() {
         let parser = NpmParser::new();
         let content = r#"
         {
@@ -659,7 +585,7 @@ mod tests {
         }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         // Should only have express and lodash, URL-based deps should be skipped
         assert_eq!(result.packages.len(), 2);
 
@@ -672,8 +598,8 @@ mod tests {
         assert!(!names.contains(&"path-pkg"));
     }
 
-    #[tokio::test]
-    async fn test_package_lock_parser_skips_url_versions() {
+    #[test]
+    fn test_package_lock_parser_skips_url_versions() {
         let parser = PackageLockParser::new();
         let content = r#"
         {
@@ -706,7 +632,7 @@ mod tests {
         }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         // Should only have test-package, express, and lodash - URL-based versions should be skipped
         assert_eq!(result.packages.len(), 3);
 
@@ -719,8 +645,8 @@ mod tests {
         assert!(!names.contains(&"workspace-pkg"));
     }
 
-    #[tokio::test]
-    async fn test_package_lock_v1_skips_url_versions() {
+    #[test]
+    fn test_package_lock_v1_skips_url_versions() {
         // Test lockfileVersion 1 format where URL is directly in the "version" field
         let parser = PackageLockParser::new();
         let content = r#"
@@ -745,7 +671,7 @@ mod tests {
         }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         // Should only have express and lodash - grunt-if with URL version should be skipped
         assert_eq!(result.packages.len(), 2);
 
@@ -755,8 +681,8 @@ mod tests {
         assert!(!names.contains(&"grunt-if"));
     }
 
-    #[tokio::test]
-    async fn test_npm_parser_package_json() {
+    #[test]
+    fn test_npm_parser_package_json() {
         let parser = NpmParser::new();
         let content = r#"
         {
@@ -772,7 +698,7 @@ mod tests {
         }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 3);
 
         let express_pkg = result
@@ -785,8 +711,8 @@ mod tests {
         assert_eq!(result.dependencies.len(), 3); // package.json now extracts dependency edges
     }
 
-    #[tokio::test]
-    async fn test_package_lock_parser() {
+    #[test]
+    fn test_package_lock_parser() {
         let parser = PackageLockParser::new();
         let content = r#"
         {
@@ -805,7 +731,7 @@ mod tests {
         }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 2);
 
         let express_pkg = result
@@ -816,8 +742,8 @@ mod tests {
         assert_eq!(express_pkg.version, Version::parse("4.17.1").unwrap());
     }
 
-    #[tokio::test]
-    async fn test_yarn_lock_parser() {
+    #[test]
+    fn test_yarn_lock_parser() {
         let parser = YarnLockParser::new();
         let content = r#"
 # yarn lockfile v1
@@ -831,7 +757,7 @@ lodash@~4.17.21:
   resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 2);
 
         let express_pkg = result
@@ -843,37 +769,7 @@ lodash@~4.17.21:
     }
 
     #[test]
-    fn test_clean_version_string() {
-        let parser = NpmParser::new();
-
-        assert_eq!(parser.clean_version_string("^4.17.1").unwrap(), "4.17.1");
-        assert_eq!(parser.clean_version_string("~4.17.21").unwrap(), "4.17.21");
-        assert_eq!(parser.clean_version_string(">=26.0.0").unwrap(), "26.0.0");
-        assert_eq!(parser.clean_version_string("4.17.1").unwrap(), "4.17.1");
-        assert_eq!(
-            parser.clean_version_string("1.0.0 - 2.0.0").unwrap(),
-            "1.0.0"
-        );
-    }
-
-    #[test]
-    fn test_parser_supports_file() {
-        let npm_parser = NpmParser::new();
-        let lock_parser = PackageLockParser::new();
-        let yarn_parser = YarnLockParser::new();
-
-        assert!(npm_parser.supports_file("package.json"));
-        assert!(!npm_parser.supports_file("package-lock.json"));
-
-        assert!(lock_parser.supports_file("package-lock.json"));
-        assert!(!lock_parser.supports_file("package.json"));
-
-        assert!(yarn_parser.supports_file("yarn.lock"));
-        assert!(!yarn_parser.supports_file("package.json"));
-    }
-
-    #[tokio::test]
-    async fn test_package_lock_v3_with_root_package() {
+    fn test_package_lock_v3_with_root_package() {
         let parser = PackageLockParser::new();
         let content = r#"
         {
@@ -904,7 +800,7 @@ lodash@~4.17.21:
         }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
 
         // Should have 3 packages: my-app, express, and accepts
         assert_eq!(result.packages.len(), 3);
@@ -950,8 +846,8 @@ lodash@~4.17.21:
         assert_eq!(express_dep.requirement, "~1.3.7");
     }
 
-    #[tokio::test]
-    async fn test_package_lock_v1_prefers_requires_for_logical_edges() {
+    #[test]
+    fn test_package_lock_v1_prefers_requires_for_logical_edges() {
         let parser = PackageLockParser::new();
         let content = r#"
         {
@@ -973,7 +869,7 @@ lodash@~4.17.21:
         }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
 
         assert!(result.dependencies.iter().any(|d| d.from.name == "express"
             && d.to.name == "accepts"

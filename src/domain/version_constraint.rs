@@ -3,7 +3,7 @@
 //! This module provides parsing and manipulation of version constraints
 //! (^1.2.3, ~1.2.3, >=1.0.0, etc.) used across different package ecosystems.
 
-use vulnera_contract::domain::vulnerability::value_objects::Version;
+use crate::domain::vulnerability::value_objects::Version;
 
 /// Version constraint for dependency specifications
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -169,8 +169,8 @@ impl VersionConstraint {
         match self {
             VersionConstraint::Exact(v) => version == v,
             VersionConstraint::Caret(v) => {
-                // ^1.2.3 means >=1.2.3 <2.0.0
-                version >= v && version < &Version::new(v.0.major + 1, 0, 0)
+                // ^1.2.3 means >=1.2.3 <2.0.0; ^0.2.3 means >=0.2.3 <0.3.0
+                version >= v && version < &Version(caret_upper_bound(&v.0))
             }
             VersionConstraint::Tilde(v) => {
                 // ~1.2.3 means >=1.2.3 <1.3.0
@@ -240,30 +240,30 @@ impl VersionConstraint {
 
                 if low.version == high.version {
                     if low.inclusive && high.inclusive {
-                        return Some(VersionConstraint::Exact(low.version));
+                        return Some(VersionConstraint::Exact(Version(low.version)));
                     }
                     return None;
                 }
 
                 Some(VersionConstraint::Range {
-                    min: low.version,
-                    max: high.version,
+                    min: Version(low.version),
+                    max: Version(high.version),
                     min_inclusive: low.inclusive,
                     max_inclusive: high.inclusive,
                 })
             }
             (Some(low), None) => {
                 if low.inclusive {
-                    Some(VersionConstraint::GreaterOrEqual(low.version))
+                    Some(VersionConstraint::GreaterOrEqual(Version(low.version)))
                 } else {
-                    Some(VersionConstraint::GreaterThan(low.version))
+                    Some(VersionConstraint::GreaterThan(Version(low.version)))
                 }
             }
             (None, Some(high)) => {
                 if high.inclusive {
-                    Some(VersionConstraint::LessOrEqual(high.version))
+                    Some(VersionConstraint::LessOrEqual(Version(high.version)))
                 } else {
-                    Some(VersionConstraint::LessThan(high.version))
+                    Some(VersionConstraint::LessThan(Version(high.version)))
                 }
             }
             (None, None) => Some(VersionConstraint::Any),
@@ -274,30 +274,30 @@ impl VersionConstraint {
         match self {
             VersionConstraint::Any => None,
             VersionConstraint::Exact(v) => Some(VersionBound {
-                version: v.clone(),
+                version: v.0.clone(),
                 inclusive: true,
             }),
             VersionConstraint::Caret(v) => Some(VersionBound {
-                version: v.clone(),
+                version: v.0.clone(),
                 inclusive: true,
             }),
             VersionConstraint::Tilde(v) => Some(VersionBound {
-                version: v.clone(),
+                version: v.0.clone(),
                 inclusive: true,
             }),
             VersionConstraint::GreaterOrEqual(v) => Some(VersionBound {
-                version: v.clone(),
+                version: v.0.clone(),
                 inclusive: true,
             }),
             VersionConstraint::GreaterThan(v) => Some(VersionBound {
-                version: v.clone(),
+                version: v.0.clone(),
                 inclusive: false,
             }),
             VersionConstraint::LessOrEqual(_) | VersionConstraint::LessThan(_) => None,
             VersionConstraint::Range {
                 min, min_inclusive, ..
             } => Some(VersionBound {
-                version: min.clone(),
+                version: min.0.clone(),
                 inclusive: *min_inclusive,
             }),
         }
@@ -307,30 +307,30 @@ impl VersionConstraint {
         match self {
             VersionConstraint::Any => None,
             VersionConstraint::Exact(v) => Some(VersionBound {
-                version: v.clone(),
+                version: v.0.clone(),
                 inclusive: true,
             }),
             VersionConstraint::Caret(v) => Some(VersionBound {
-                version: caret_upper_bound(v),
+                version: caret_upper_bound(&v.0),
                 inclusive: false,
             }),
             VersionConstraint::Tilde(v) => Some(VersionBound {
-                version: Version::new(v.0.major, v.0.minor + 1, 0),
+                version: semver::Version::new(v.0.major, v.0.minor + 1, 0),
                 inclusive: false,
             }),
             VersionConstraint::GreaterOrEqual(_) | VersionConstraint::GreaterThan(_) => None,
             VersionConstraint::LessOrEqual(v) => Some(VersionBound {
-                version: v.clone(),
+                version: v.0.clone(),
                 inclusive: true,
             }),
             VersionConstraint::LessThan(v) => Some(VersionBound {
-                version: v.clone(),
+                version: v.0.clone(),
                 inclusive: false,
             }),
             VersionConstraint::Range {
                 max, max_inclusive, ..
             } => Some(VersionBound {
-                version: max.clone(),
+                version: max.0.clone(),
                 inclusive: *max_inclusive,
             }),
         }
@@ -338,12 +338,65 @@ impl VersionConstraint {
 }
 
 #[derive(Clone)]
-struct VersionBound {
-    version: Version,
-    inclusive: bool,
+pub(crate) struct VersionBound {
+    pub version: semver::Version,
+    pub inclusive: bool,
 }
 
-fn max_lower_bound(left: VersionBound, right: VersionBound) -> VersionBound {
+#[derive(Clone)]
+pub(crate) struct VersionInterval {
+    pub lower: Option<VersionBound>,
+    pub upper: Option<VersionBound>,
+}
+
+impl VersionInterval {
+    pub fn any() -> Self {
+        Self {
+            lower: None,
+            upper: None,
+        }
+    }
+
+    pub fn intersect(self, other: Self) -> Option<Self> {
+        let lower = match (self.lower, other.lower) {
+            (None, right) => right,
+            (left, None) => left,
+            (Some(left), Some(right)) => Some(max_lower_bound(left, right)),
+        };
+
+        let upper = match (self.upper, other.upper) {
+            (None, right) => right,
+            (left, None) => left,
+            (Some(left), Some(right)) => Some(min_upper_bound(left, right)),
+        };
+
+        let candidate = Self { lower, upper };
+        if candidate.is_empty() {
+            None
+        } else {
+            Some(candidate)
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match (&self.lower, &self.upper) {
+            (Some(lower), Some(upper)) => {
+                if lower.version > upper.version {
+                    return true;
+                }
+
+                if lower.version < upper.version {
+                    return false;
+                }
+
+                !lower.inclusive || !upper.inclusive
+            }
+            _ => false,
+        }
+    }
+}
+
+pub(crate) fn max_lower_bound(left: VersionBound, right: VersionBound) -> VersionBound {
     if left.version > right.version {
         left
     } else if right.version > left.version {
@@ -356,7 +409,7 @@ fn max_lower_bound(left: VersionBound, right: VersionBound) -> VersionBound {
     }
 }
 
-fn min_upper_bound(left: VersionBound, right: VersionBound) -> VersionBound {
+pub(crate) fn min_upper_bound(left: VersionBound, right: VersionBound) -> VersionBound {
     if left.version < right.version {
         left
     } else if right.version < left.version {
@@ -369,13 +422,13 @@ fn min_upper_bound(left: VersionBound, right: VersionBound) -> VersionBound {
     }
 }
 
-fn caret_upper_bound(version: &Version) -> Version {
-    if version.0.major > 0 {
-        Version::new(version.0.major + 1, 0, 0)
-    } else if version.0.minor > 0 {
-        Version::new(0, version.0.minor + 1, 0)
+pub(crate) fn caret_upper_bound(version: &semver::Version) -> semver::Version {
+    if version.major > 0 {
+        semver::Version::new(version.major + 1, 0, 0)
+    } else if version.minor > 0 {
+        semver::Version::new(0, version.minor + 1, 0)
     } else {
-        Version::new(0, 0, version.0.patch + 1)
+        semver::Version::new(0, 0, version.patch + 1)
     }
 }
 

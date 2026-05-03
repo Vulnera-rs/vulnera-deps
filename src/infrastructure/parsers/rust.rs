@@ -1,9 +1,9 @@
 //! Rust ecosystem parsers
 
-use super::traits::{PackageFileParser, ParseResult};
-use crate::application::errors::ParseError;
-use async_trait::async_trait;
-use vulnera_contract::domain::vulnerability::{
+use super::traits::{FilePattern, PackageFileParser, ParseResult, SourceType};
+use super::version_extractor;
+use crate::domain::errors::ParseError;
+use crate::domain::vulnerability::{
     entities::{Dependency, Package},
     value_objects::{Ecosystem, Version},
 };
@@ -51,12 +51,10 @@ impl CargoParser {
                     _ => "0.0.0".to_string(),
                 };
 
-                // Clean version string
-                let clean_version = self.clean_cargo_version(&version_str)?;
-
-                let version = Version::parse(&clean_version).map_err(|_| ParseError::Version {
-                    version: version_str.clone(),
-                })?;
+                // Use centralized version extractor
+                let Some((_, version)) = version_extractor::cargo(&version_str)? else {
+                    continue; // Skip wildcards (*) and unresolvable versions
+                };
 
                 let package = Package::new(name.clone(), version, Ecosystem::Cargo)
                     .map_err(|e| ParseError::MissingField { field: e })?;
@@ -76,57 +74,19 @@ impl CargoParser {
         Ok(ParseResult {
             packages,
             dependencies,
+            source_type: SourceType::Manifest,
         })
-    }
-
-    /// Clean Cargo version specifier
-    fn clean_cargo_version(&self, version_str: &str) -> Result<String, ParseError> {
-        let version_str = version_str.trim();
-
-        if version_str.is_empty() || version_str == "*" {
-            return Ok("0.0.0".to_string());
-        }
-
-        // Remove common Cargo prefixes
-        let cleaned = if version_str.starts_with('^') || version_str.starts_with('~') {
-            &version_str[1..]
-        } else if version_str.starts_with(">=") || version_str.starts_with("<=") {
-            &version_str[2..]
-        } else if version_str.starts_with('>')
-            || version_str.starts_with('<')
-            || version_str.starts_with('=')
-        {
-            &version_str[1..]
-        } else {
-            version_str
-        };
-
-        // Handle version ranges (take the first version)
-        let cleaned = if let Some(comma_pos) = cleaned.find(',') {
-            &cleaned[..comma_pos]
-        } else {
-            cleaned
-        };
-
-        let cleaned = cleaned.trim();
-
-        if cleaned.is_empty() {
-            Ok("0.0.0".to_string())
-        } else {
-            Ok(cleaned.to_string())
-        }
     }
 }
 
-#[async_trait]
 impl PackageFileParser for CargoParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        filename == "Cargo.toml"
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         let toml_value: toml::Value = toml::from_str(content)?;
-        let mut result = ParseResult::default();
+        let mut result = ParseResult {
+            packages: Vec::new(),
+            dependencies: Vec::new(),
+            source_type: SourceType::Manifest,
+        };
 
         // Extract root package info
         let root_name = toml_value
@@ -161,6 +121,12 @@ impl PackageFileParser for CargoParser {
         result.packages.extend(build_deps.packages);
         result.dependencies.extend(build_deps.dependencies);
 
+        // Extract from workspace.dependencies section
+        let workspace_deps =
+            self.extract_dependencies(&toml_value, "workspace.dependencies", &root_package)?;
+        result.packages.extend(workspace_deps.packages);
+        result.dependencies.extend(workspace_deps.dependencies);
+
         Ok(result)
     }
 
@@ -168,8 +134,8 @@ impl PackageFileParser for CargoParser {
         Ecosystem::Cargo
     }
 
-    fn priority(&self) -> u8 {
-        10 // High priority for Cargo.toml
+    fn patterns(&self) -> &[FilePattern] {
+        &[FilePattern::Name("Cargo.toml")]
     }
 }
 
@@ -211,9 +177,12 @@ impl CargoLockParser {
                             field: "package version".to_string(),
                         })?;
 
-                    let version = Version::parse(version_str).map_err(|_| ParseError::Version {
-                        version: version_str.to_string(),
-                    })?;
+                    let version =
+                        version_extractor::cargo_locked(version_str)?.ok_or_else(|| {
+                            ParseError::Version {
+                                version: version_str.to_string(),
+                            }
+                        })?;
 
                     let package = Package::new(name.to_string(), version, Ecosystem::Cargo)
                         .map_err(|e| ParseError::MissingField { field: e })?;
@@ -281,17 +250,13 @@ impl CargoLockParser {
         Ok(ParseResult {
             packages,
             dependencies,
+            source_type: SourceType::LockFile,
         })
     }
 }
 
-#[async_trait]
 impl PackageFileParser for CargoLockParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        filename == "Cargo.lock"
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         let toml_value: toml::Value = toml::from_str(content)?;
         self.extract_lock_data(&toml_value)
     }
@@ -300,8 +265,8 @@ impl PackageFileParser for CargoLockParser {
         Ecosystem::Cargo
     }
 
-    fn priority(&self) -> u8 {
-        15 // Higher priority than Cargo.toml for exact versions
+    fn patterns(&self) -> &[FilePattern] {
+        &[FilePattern::Name("Cargo.lock")]
     }
 }
 
@@ -309,8 +274,8 @@ impl PackageFileParser for CargoLockParser {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_cargo_toml_parser() {
+    #[test]
+    fn test_cargo_toml_parser() {
         let parser = CargoParser::new();
         let content = r#"
 [package]
@@ -327,7 +292,7 @@ clap = "~3.2"
 tokio-test = "0.4"
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 5);
 
         let serde_pkg = result.packages.iter().find(|p| p.name == "serde").unwrap();
@@ -338,8 +303,8 @@ tokio-test = "0.4"
         assert_eq!(tokio_pkg.version, Version::parse("1.0").unwrap());
     }
 
-    #[tokio::test]
-    async fn test_cargo_lock_parser() {
+    #[test]
+    fn test_cargo_lock_parser() {
         let parser = CargoLockParser::new();
         let content = r#"
 # This file is automatically @generated by Cargo.
@@ -360,7 +325,7 @@ dependencies = [
 ]
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 2);
 
         let serde_pkg = result.packages.iter().find(|p| p.name == "serde").unwrap();
@@ -371,26 +336,11 @@ dependencies = [
     }
 
     #[test]
-    fn test_clean_cargo_version() {
-        let parser = CargoParser::new();
-
-        assert_eq!(parser.clean_cargo_version("1.0").unwrap(), "1.0");
-        assert_eq!(parser.clean_cargo_version("^1.0").unwrap(), "1.0");
-        assert_eq!(parser.clean_cargo_version("~1.0").unwrap(), "1.0");
-        assert_eq!(parser.clean_cargo_version(">=1.0").unwrap(), "1.0");
-        assert_eq!(parser.clean_cargo_version("1.0, <2.0").unwrap(), "1.0");
-        assert_eq!(parser.clean_cargo_version("*").unwrap(), "0.0.0");
-    }
-
-    #[test]
-    fn test_parser_supports_file() {
+    fn test_parser_patterns() {
         let cargo_parser = CargoParser::new();
         let lock_parser = CargoLockParser::new();
 
-        assert!(cargo_parser.supports_file("Cargo.toml"));
-        assert!(!cargo_parser.supports_file("Cargo.lock"));
-
-        assert!(lock_parser.supports_file("Cargo.lock"));
-        assert!(!lock_parser.supports_file("Cargo.toml"));
+        assert_eq!(cargo_parser.patterns(), &[FilePattern::Name("Cargo.toml")]);
+        assert_eq!(lock_parser.patterns(), &[FilePattern::Name("Cargo.lock")]);
     }
 }

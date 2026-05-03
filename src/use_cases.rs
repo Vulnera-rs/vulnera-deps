@@ -6,124 +6,142 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::application::errors::ApplicationError;
-use vulnera_contract::domain::vulnerability::{
+use crate::application::events::{DependencyEvent, EventEmitter};
+use crate::domain::vulnerability::{
     entities::{AnalysisReport, Package, Vulnerability},
-    repositories::IVulnerabilityRepository,
-    value_objects::{Ecosystem, VulnerabilityId},
+    value_objects::Ecosystem,
 };
-use vulnera_contract::application::vulnerability::services::CacheService;
+use crate::services::cache::CacheService;
 
-use crate::parsers::{ParseResult, ParserFactory};
-use vulnera_contract::infrastructure::registries::{
-    PackageRegistryClient, VulneraRegistryAdapter,
-};
+use crate::infrastructure::parsers::{ParseResult, ParserFactory};
+use crate::infrastructure::registries::{PackageRegistryClient, VulneraRegistryAdapter};
 
 use crate::application::analysis_context::{AnalysisContext, detect_workspace};
 use crate::domain::{DependencyGraph, PackageId};
+use crate::services::contamination::ContaminationPathAnalyzer;
+use crate::services::graph::UnifiedDependencyGraph;
+use crate::services::remediation::RemediationResolver;
 use crate::services::resolution_algorithms::{BacktrackingResolver, LexicographicOptimizer};
 use crate::services::{
-    PopularPackageService, PopularPackageVulnerabilityResult,
     dependency_resolver::{DependencyResolverService, DependencyResolverServiceImpl},
     resolution::RecursiveResolver,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
+use vulnera_advisor::{PackageRegistry, VulnerabilityManager};
 
 /// Use case for analyzing dependencies from a file
 pub struct AnalyzeDependenciesUseCase<C: CacheService + 'static> {
     parser_factory: Arc<ParserFactory>,
-    vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
+    advisor: Arc<VulnerabilityManager>,
     cache_service: Arc<C>,
     max_concurrent_requests: usize,
     max_concurrent_registry_queries: usize,
     dependency_resolver: Arc<dyn DependencyResolverService>,
     recursive_resolver: Arc<RecursiveResolver<C>>,
     analysis_context: Option<Arc<AnalysisContext>>,
+    remediation_resolver: Arc<RemediationResolver>,
+    event_emitter: Arc<dyn EventEmitter>,
 }
 
 impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
     /// Create a new use case instance
     pub fn new(
         parser_factory: Arc<ParserFactory>,
-        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
+        advisor: Arc<VulnerabilityManager>,
+        registry: Arc<PackageRegistry>,
         cache_service: Arc<C>,
         max_concurrent_requests: usize,
+        event_emitter: Arc<dyn EventEmitter>,
     ) -> Self {
-        let dependency_resolver =
-            Arc::new(DependencyResolverServiceImpl::new(parser_factory.clone()));
+        let dependency_resolver = Arc::new(DependencyResolverServiceImpl::new());
+        let remediation_resolver =
+            Arc::new(RemediationResolver::new(advisor.clone(), registry.clone()));
         let registry_client = Arc::new(VulneraRegistryAdapter::new());
         let recursive_resolver = Arc::new(RecursiveResolver::new(
             registry_client,
             cache_service.clone(),
-            5, // Default max depth
+            5,
         ));
         Self {
             parser_factory,
-            vulnerability_repository,
+            advisor,
             cache_service,
             max_concurrent_requests,
-            max_concurrent_registry_queries: 5, // Default value
+            max_concurrent_registry_queries: 5,
             dependency_resolver,
             recursive_resolver,
             analysis_context: None,
+            remediation_resolver,
+            event_emitter,
         }
     }
 
     /// Create a new use case instance with full configuration
     pub fn new_with_config(
         parser_factory: Arc<ParserFactory>,
-        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
+        advisor: Arc<VulnerabilityManager>,
+        registry: Arc<PackageRegistry>,
         cache_service: Arc<C>,
         max_concurrent_requests: usize,
         max_concurrent_registry_queries: usize,
+        event_emitter: Arc<dyn EventEmitter>,
     ) -> Self {
-        let dependency_resolver =
-            Arc::new(DependencyResolverServiceImpl::new(parser_factory.clone()));
+        let dependency_resolver = Arc::new(DependencyResolverServiceImpl::new());
+        let remediation_resolver =
+            Arc::new(RemediationResolver::new(advisor.clone(), registry.clone()));
         let registry_client = Arc::new(VulneraRegistryAdapter::new());
         let recursive_resolver = Arc::new(RecursiveResolver::new(
             registry_client,
             cache_service.clone(),
-            5, // Default max depth
+            5,
         ));
         Self {
             parser_factory,
-            vulnerability_repository,
+            advisor,
             cache_service,
             max_concurrent_requests,
             max_concurrent_registry_queries,
             dependency_resolver,
             recursive_resolver,
             analysis_context: None,
+            remediation_resolver,
+            event_emitter,
         }
     }
 
     /// Create a new use case instance with analysis context
     pub fn new_with_context(
         parser_factory: Arc<ParserFactory>,
-        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
+        advisor: Arc<VulnerabilityManager>,
+        registry: Arc<PackageRegistry>,
         cache_service: Arc<C>,
         max_concurrent_requests: usize,
         max_concurrent_registry_queries: usize,
         project_root: Option<PathBuf>,
+        event_emitter: Arc<dyn EventEmitter>,
     ) -> Self {
-        let dependency_resolver =
-            Arc::new(DependencyResolverServiceImpl::new(parser_factory.clone()));
+        let dependency_resolver = Arc::new(DependencyResolverServiceImpl::new());
+        let remediation_resolver =
+            Arc::new(RemediationResolver::new(advisor.clone(), registry.clone()));
         let registry_client = Arc::new(VulneraRegistryAdapter::new());
         let recursive_resolver = Arc::new(RecursiveResolver::new(
             registry_client,
             cache_service.clone(),
-            5, // Default max depth
+            5,
         ));
         let analysis_context = project_root.map(|root| Arc::new(AnalysisContext::new(root)));
         Self {
             parser_factory,
-            vulnerability_repository,
+            advisor,
             cache_service,
             max_concurrent_requests,
             max_concurrent_registry_queries,
             dependency_resolver,
             recursive_resolver,
             analysis_context,
+            remediation_resolver,
+            event_emitter,
         }
     }
 
@@ -141,6 +159,13 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
             ecosystem
         );
 
+        self.event_emitter
+            .emit(DependencyEvent::AnalysisStarted {
+                file_path: filename.unwrap_or("unknown").to_string(),
+                ecosystem: ecosystem.to_string(),
+            })
+            .await;
+
         // Use analysis context for workspace detection and caching if available
         let file_path = filename.map(PathBuf::from);
         if let (Some(ctx), Some(path)) = (&self.analysis_context, &file_path) {
@@ -154,6 +179,9 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                         vec![],
                         start_time.elapsed(),
                         vec!["File ignored".to_string()],
+                        false,
+                        0,
+                        0,
                     ),
                     empty_graph,
                 ));
@@ -204,11 +232,30 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
             && filename.map(|f| f.ends_with("Cargo.toml")).unwrap_or(false);
 
         // Parse the dependency file
-        let parse_result = self
-            .parse_dependencies(file_content, ecosystem.clone(), filename)
-            .await?;
+        let parse_result = match self.parse_dependencies(file_content, ecosystem.clone(), filename)
+        {
+            Ok(result) => result,
+            Err(e) => {
+                self.event_emitter
+                    .emit(DependencyEvent::AnalysisError {
+                        file_path: filename.unwrap_or("unknown").to_string(),
+                        error: e.to_string(),
+                    })
+                    .await;
+                return Err(e);
+            }
+        };
         let mut packages = parse_result.packages;
         let dependencies = parse_result.dependencies;
+
+        for pkg in &packages {
+            self.event_emitter
+                .emit(DependencyEvent::PackageParsed {
+                    package: pkg.clone(),
+                    location: None,
+                })
+                .await;
+        }
 
         if packages.is_empty() {
             warn!("No packages found in dependency file");
@@ -220,16 +267,31 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                     vec![],
                     analysis_duration,
                     vec!["No packages found".to_string()],
+                    false,
+                    0,
+                    0,
                 ),
                 empty_graph,
             ));
         }
 
         // Build dependency graph using DependencyResolverService
-        let mut dependency_graph = self
+        let mut dependency_graph = match self
             .dependency_resolver
             .build_graph(packages.clone(), dependencies, ecosystem.clone())
-            .await?;
+            .await
+        {
+            Ok(graph) => graph,
+            Err(e) => {
+                self.event_emitter
+                    .emit(DependencyEvent::AnalysisError {
+                        file_path: filename.unwrap_or("unknown").to_string(),
+                        error: e.to_string(),
+                    })
+                    .await;
+                return Err(e);
+            }
+        };
 
         // If the graph is empty (manifest-only project without lockfile),
         // use the RecursiveResolver to perform a deep subtree resolution.
@@ -328,7 +390,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                     Result<
                         (
                             usize,
-                            Option<vulnera_contract::domain::vulnerability::value_objects::Version>,
+                            Option<crate::domain::vulnerability::value_objects::Version>,
                         ),
                         ApplicationError,
                     >,
@@ -338,19 +400,19 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                     let pkg_name = pkg.name.clone();
                     let lower = pkg.version.clone();
                     let upper = if lower.0.major > 0 {
-                        vulnera_contract::domain::vulnerability::value_objects::Version::new(
+                        crate::domain::vulnerability::value_objects::Version::new(
                             lower.0.major + 1,
                             0,
                             0,
                         )
                     } else if lower.0.minor > 0 {
-                        vulnera_contract::domain::vulnerability::value_objects::Version::new(
+                        crate::domain::vulnerability::value_objects::Version::new(
                             0,
                             lower.0.minor + 1,
                             0,
                         )
                     } else {
-                        vulnera_contract::domain::vulnerability::value_objects::Version::new(
+                        crate::domain::vulnerability::value_objects::Version::new(
                             0,
                             0,
                             lower.0.patch + 1,
@@ -361,8 +423,8 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                     join_set.spawn(async move {
                         let _permit = permit.acquire().await.map_err(|e| {
                             ApplicationError::Vulnerability(
-                                vulnera_contract::application::errors::VulnerabilityError::Api(
-                                    vulnera_contract::application::errors::ApiError::Http {
+                                crate::application::errors::VulnerabilityError::Api(
+                                    crate::application::errors::ApiError::Http {
                                         status: 500,
                                         message: format!("Failed to acquire semaphore: {}", e),
                                     },
@@ -443,13 +505,79 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
             packages.iter().map(|p| Arc::new(p.clone())).collect();
 
         // Look up vulnerabilities for all packages concurrently
-        let vulnerabilities = self
-            .process_packages_concurrently_arc(&packages_arc)
-            .await?;
+        let vulnerabilities = match self
+            .process_packages_concurrently_arc(&packages_arc, self.event_emitter.clone())
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                self.event_emitter
+                    .emit(DependencyEvent::AnalysisError {
+                        file_path: filename.unwrap_or("unknown").to_string(),
+                        error: e.to_string(),
+                    })
+                    .await;
+                return Err(e);
+            }
+        };
+
+        // Build UnifiedDependencyGraph for path analysis
+        let unified_graph = UnifiedDependencyGraph::from_dependency_graph(&dependency_graph)
+            .unwrap_or_else(|_| UnifiedDependencyGraph::new());
+
+        // Run contamination analysis for each vulnerability
+        let root_ids: Vec<PackageId> = dependency_graph.root_packages.clone();
+        let mut total_contamination_paths = 0usize;
+        let mut contaminated_vulnerabilities = 0usize;
+        for vuln in &vulnerabilities {
+            let mut vuln_contaminated = false;
+            for affected in &vuln.affected_packages {
+                self.event_emitter
+                    .emit(DependencyEvent::VulnerabilityFound {
+                        package: affected.package.clone(),
+                        vulnerability: vuln.clone(),
+                    })
+                    .await;
+
+                let pkg_id = PackageId::from_package(&affected.package);
+                for root in &root_ids {
+                    let result = ContaminationPathAnalyzer::analyze(&unified_graph, root, &pkg_id);
+                    if result.contaminated {
+                        vuln_contaminated = true;
+                        total_contamination_paths += result.path_count;
+                        debug!(
+                            "Contamination path from {:?} to {:?}: {} paths (truncated: {})",
+                            root, pkg_id, result.path_count, result.truncated
+                        );
+                    }
+                }
+
+                // Resolve remediation
+                match self
+                    .remediation_resolver
+                    .resolve(&unified_graph, &pkg_id, &affected.package.version)
+                    .await
+                {
+                    Ok(plan) => {
+                        debug!(
+                            "Remediation for {}: nearest={:?}, latest={:?}, bump={:?}",
+                            pkg_id, plan.nearest_safe, plan.latest_safe, plan.bump_type
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to resolve remediation for {}: {}", pkg_id, e);
+                    }
+                }
+            }
+            if vuln_contaminated {
+                contaminated_vulnerabilities += 1;
+            }
+        }
 
         let analysis_duration = start_time.elapsed();
         let sources_queried = {
             let mut set = std::collections::BTreeSet::new();
+            set.insert("vulnera-advisor".to_string());
             for v in &vulnerabilities {
                 for src in &v.sources {
                     set.insert(format!("{:?}", src));
@@ -505,11 +633,18 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
             }
         }
 
+        let packages_found = packages.len();
+        let vulnerabilities_found = vulnerabilities.len();
+
+        let contamination_completed = !root_ids.is_empty();
         let report = AnalysisReport::new(
             packages,
             vulnerabilities,
             analysis_duration,
             sources_queried,
+            contamination_completed,
+            total_contamination_paths,
+            contaminated_vulnerabilities,
         );
 
         info!(
@@ -548,11 +683,20 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
             }
         }
 
+        self.event_emitter
+            .emit(DependencyEvent::AnalysisCompleted {
+                file_path: filename.unwrap_or("unknown").to_string(),
+                packages_found,
+                vulnerabilities_found,
+                duration_ms: analysis_duration.as_millis() as u64,
+            })
+            .await;
+
         Ok((report, dependency_graph))
     }
 
     /// Parse dependency file content into packages
-    async fn parse_dependencies(
+    fn parse_dependencies(
         &self,
         file_content: &str,
         ecosystem: Ecosystem,
@@ -563,10 +707,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
             && let Some(parser) = self.parser_factory.create_parser(filename)
         {
             debug!("Using parser for filename: {}", filename);
-            return parser
-                .parse_file(file_content)
-                .await
-                .map_err(ApplicationError::Parse);
+            return parser.parse(file_content).map_err(ApplicationError::Parse);
         }
 
         // Fall back to ecosystem-based parsing by trying common filenames for the ecosystem
@@ -594,10 +735,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                     "Using parser for ecosystem {:?} with filename: {}",
                     ecosystem, filename
                 );
-                return parser
-                    .parse_file(file_content)
-                    .await
-                    .map_err(ApplicationError::Parse);
+                return parser.parse(file_content).map_err(ApplicationError::Parse);
             }
         }
 
@@ -612,121 +750,83 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
     async fn process_packages_concurrently_arc(
         &self,
         packages: &[Arc<Package>],
+        event_emitter: Arc<dyn EventEmitter>,
     ) -> Result<Vec<Vulnerability>, ApplicationError> {
-        // Pre-allocate vector with estimated capacity to avoid reallocations
-        // Estimate: average 2-3 vulnerabilities per package
-        let estimated_capacity = packages.len() * 3;
-        let mut all_vulnerabilities = Vec::with_capacity(estimated_capacity);
-        let mut processed_count = 0;
-        let mut join_set: JoinSet<Result<(String, Vec<Vulnerability>), ApplicationError>> =
-            JoinSet::new();
+        let mut all_vulnerabilities = Vec::new();
+        let mut join_set: JoinSet<Result<Vec<Vulnerability>, ApplicationError>> = JoinSet::new();
 
-        info!(
-            "Processing {} packages with max_concurrent_requests: {}",
-            packages.len(),
-            self.max_concurrent_requests
-        );
-
-        // Process packages in chunks to respect concurrency limits
         for chunk in packages.chunks(self.max_concurrent_requests) {
-            // Spawn tasks for current chunk
             for package_arc in chunk {
-                let package_arc = Arc::clone(package_arc);
-                let vuln_repo = self.vulnerability_repository.clone();
+                let advisor = self.advisor.clone();
                 let cache_service = self.cache_service.clone();
+                let package_clone = Arc::clone(package_arc);
+                let cache_key = crate::services::cache::package_vulnerabilities_key(&package_clone);
+                let emitter = event_emitter.clone();
 
                 join_set.spawn(async move {
-                            let package_id = package_arc.identifier();
+                    // Check cache
+                    if let Ok(Some(cached)) =
+                        cache_service.get::<Vec<Vulnerability>>(&cache_key).await
+                    {
+                        emitter
+                            .emit(DependencyEvent::CacheHit {
+                                package_id: PackageId::from_package(&package_clone),
+                            })
+                            .await;
+                        let filtered: Vec<Vulnerability> = cached
+                            .into_iter()
+                            .filter(|v| v.affects_package(&package_clone))
+                            .collect();
+                        return Ok(filtered);
+                    }
 
-                            // Use optimized cache key generation
-                            let cache_key = vulnera_contract::infrastructure::cache::CacheServiceImpl::package_vulnerabilities_key(&package_arc);
+                    emitter
+                        .emit(DependencyEvent::CacheMiss {
+                            package_id: PackageId::from_package(&package_clone),
+                        })
+                        .await;
 
-                            // Check cache first
-                            if let Ok(Some(cached_vulns)) =
-                                cache_service.get::<Vec<Vulnerability>>(&cache_key).await
-                            {
-                                let total = cached_vulns.len();
-                                // Filter to only vulnerabilities that actually affect this package version
-                                let filtered: Vec<Vulnerability> = cached_vulns
-                                    .into_iter()
-                                    .filter(|v| v.affects_package(&package_arc))
-                                    .collect();
-                                debug!("Cache hit for package: {} (filtered {} -> {} affecting current version)", package_id, total, filtered.len());
-                                return Ok((package_id, filtered));
-                            }
+                    // Query real advisor
+                    let eco_str = package_clone.ecosystem.advisor_name();
+                    let ver_str = package_clone.version.to_string();
+                    match advisor
+                        .matches(eco_str, &package_clone.name, &ver_str)
+                        .await
+                    {
+                        Ok(advisories) => {
+                            let vulnerabilities: Vec<Vulnerability> = advisories
+                                .into_iter()
+                                .filter_map(|a| advisory_to_vulnerability(a, &package_clone))
+                                .collect();
 
-                            // Cache miss - query repository if available
-                            let Some(vuln_repo) = vuln_repo else {
-                                return Ok((package_id, vec![]));
-                            };
+                            // Cache filtered results
+                            let cache_ttl = std::time::Duration::from_secs(24 * 3600);
+                            let _ = cache_service
+                                .set(&cache_key, &vulnerabilities, cache_ttl)
+                                .await;
 
-                            debug!(
-                                "Cache miss for package: {}, querying repository",
-                                package_id
+                            Ok(vulnerabilities)
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to query advisor for {}: {}",
+                                package_clone.identifier(),
+                                e
                             );
-
-                            match vuln_repo.find_vulnerabilities(&package_arc).await {
-                                Ok(vulnerabilities) => {
-                                    let total = vulnerabilities.len();
-                                    let filtered: Vec<Vulnerability> = vulnerabilities
-                                        .into_iter()
-                                        .filter(|v| v.affects_package(&package_arc))
-                                        .collect();
-
-                                    // Cache the filtered result for future use
-                                    let cache_ttl = std::time::Duration::from_secs(24 * 3600); // 24 hours
-                                    if let Err(e) = cache_service
-                                        .set(&cache_key, &filtered, cache_ttl)
-                                        .await
-                                    {
-                                        warn!("Failed to cache vulnerabilities for {}: {}", package_id, e);
-                                    }
-
-                                    debug!(
-                                        "Found {} vulnerabilities for package: {} ({} affect current version)",
-                                        total,
-                                        package_id,
-                                        filtered.len()
-                                    );
-                                    Ok((package_id, filtered))
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to lookup vulnerabilities for package {}: {}",
-                                        package_id, e
-                                    );
-                                    // Continue processing other packages instead of failing completely
-                                    Ok((package_id, vec![]))
-                                }
-                            }
-                        });
+                            Ok(vec![])
+                        }
+                    }
+                });
             }
 
-            // Collect results from current chunk
             while let Some(result) = join_set.join_next().await {
                 match result {
-                    Ok(Ok((package_id, vulnerabilities))) => {
-                        processed_count += 1;
-                        debug!("Completed processing package: {}", package_id);
-                        all_vulnerabilities.extend(vulnerabilities);
-                    }
-                    Ok(Err(e)) => {
-                        error!("Package processing error: {}", e);
-                        processed_count += 1;
-                    }
-                    Err(e) => {
-                        error!("Join error: {}", e);
-                        processed_count += 1;
-                    }
+                    Ok(Ok(vulns)) => all_vulnerabilities.extend(vulns),
+                    Ok(Err(e)) => warn!("Package processing error: {}", e),
+                    Err(e) => warn!("Join error: {}", e),
                 }
             }
         }
-
-        info!(
-            "Processed {} packages, found {} total vulnerabilities",
-            processed_count,
-            all_vulnerabilities.len()
-        );
 
         Ok(all_vulnerabilities)
     }
@@ -737,10 +837,10 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
         graph: &DependencyGraph,
         ecosystem: Ecosystem,
     ) -> Result<
-        HashMap<PackageId, Vec<vulnera_contract::domain::vulnerability::value_objects::Version>>,
+        HashMap<PackageId, Vec<crate::domain::vulnerability::value_objects::Version>>,
         ApplicationError,
     > {
-        use vulnera_contract::infrastructure::registries::VulneraRegistryAdapter;
+        use crate::infrastructure::registries::VulneraRegistryAdapter;
 
         let registry: Arc<dyn PackageRegistryClient> = Arc::new(VulneraRegistryAdapter::new());
 
@@ -752,7 +852,7 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
             Result<
                 (
                     PackageId,
-                    Vec<vulnera_contract::domain::vulnerability::value_objects::Version>,
+                    Vec<crate::domain::vulnerability::value_objects::Version>,
                 ),
                 ApplicationError,
             >,
@@ -769,8 +869,8 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
             join_set.spawn(async move {
                 let _permit = permit.acquire().await.map_err(|e| {
                     ApplicationError::Vulnerability(
-                        vulnera_contract::application::errors::VulnerabilityError::Api(
-                            vulnera_contract::application::errors::ApiError::Http {
+                        crate::application::errors::VulnerabilityError::Api(
+                            crate::application::errors::ApiError::Http {
                                 status: 500,
                                 message: format!("Failed to acquire semaphore: {}", e),
                             },
@@ -783,9 +883,8 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
                     .await
                 {
                     Ok(version_infos) => {
-                        let versions: Vec<
-                            vulnera_contract::domain::vulnerability::value_objects::Version,
-                        > = version_infos.into_iter().map(|vi| vi.version).collect();
+                        let versions: Vec<crate::domain::vulnerability::value_objects::Version> =
+                            version_infos.into_iter().map(|vi| vi.version).collect();
                         Ok((package_id_clone, versions))
                     }
                     Err(e) => {
@@ -820,100 +919,133 @@ impl<C: CacheService + 'static> AnalyzeDependenciesUseCase<C> {
     }
 }
 
-/// Use case for getting vulnerability details by ID
-pub struct GetVulnerabilityDetailsUseCase<C: CacheService> {
-    vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
-    cache_service: Arc<C>,
-}
+/// Map a vulnera_advisor Advisory to our domain Vulnerability.
+fn advisory_to_vulnerability(
+    advisory: vulnera_advisor::Advisory,
+    package: &Package,
+) -> Option<Vulnerability> {
+    let id = crate::domain::vulnerability::value_objects::VulnerabilityId::new(advisory.id.clone())
+        .ok()?;
 
-impl<C: CacheService + 'static> GetVulnerabilityDetailsUseCase<C> {
-    /// Create a new use case instance
-    pub fn new(
-        vulnerability_repository: Option<Arc<dyn IVulnerabilityRepository>>,
-        cache_service: Arc<C>,
-    ) -> Self {
-        Self {
-            vulnerability_repository,
-            cache_service,
-        }
-    }
+    let severity = advisory
+        .enrichment
+        .as_ref()
+        .and_then(|e| e.cvss_v3_severity)
+        .map(|s| match s {
+            vulnera_advisor::Severity::Critical => {
+                crate::domain::vulnerability::value_objects::Severity::Critical
+            }
+            vulnera_advisor::Severity::High => {
+                crate::domain::vulnerability::value_objects::Severity::High
+            }
+            vulnera_advisor::Severity::Medium => {
+                crate::domain::vulnerability::value_objects::Severity::Medium
+            }
+            vulnera_advisor::Severity::Low => {
+                crate::domain::vulnerability::value_objects::Severity::Low
+            }
+            vulnera_advisor::Severity::None => {
+                crate::domain::vulnerability::value_objects::Severity::Low
+            }
+        })
+        .unwrap_or(crate::domain::vulnerability::value_objects::Severity::Medium);
 
-    /// Execute the use case to get vulnerability details
-    pub async fn execute(
-        &self,
-        vulnerability_id: &VulnerabilityId,
-    ) -> Result<Vulnerability, ApplicationError> {
-        let cache_key = format!("vuln_details:{}", vulnerability_id.as_str());
+    let affected_packages: Vec<crate::domain::vulnerability::entities::AffectedPackage> = advisory
+        .affected
+        .iter()
+        .map(|aff| {
+            let pkg = Package::new(
+                aff.package.name.clone(),
+                package.version.clone(),
+                crate::domain::vulnerability::value_objects::Ecosystem::from_alias(
+                    &aff.package.ecosystem,
+                )
+                .unwrap_or(package.ecosystem.clone()),
+            )
+            .unwrap_or_else(|_| package.clone());
 
-        // Try cache first
-        if let Some(cached_vulnerability) =
-            self.cache_service.get::<Vulnerability>(&cache_key).await?
-        {
-            debug!("Cache hit for vulnerability: {}", vulnerability_id.as_str());
-            return Ok(cached_vulnerability);
-        }
+            let vulnerable_ranges: Vec<crate::domain::vulnerability::value_objects::VersionRange> =
+                aff.ranges
+                    .iter()
+                    .map(|r| {
+                        let introduced = r.events.iter().find_map(|e| {
+                            if let vulnera_advisor::Event::Introduced(v) = e {
+                                Some(v.clone())
+                            } else {
+                                None
+                            }
+                        });
+                        let fixed = r.events.iter().find_map(|e| {
+                            if let vulnera_advisor::Event::Fixed(v) = e {
+                                Some(v.clone())
+                            } else {
+                                None
+                            }
+                        });
+                        let start = introduced.as_ref().and_then(|v| {
+                            crate::domain::vulnerability::value_objects::Version::parse(v).ok()
+                        });
+                        let end = fixed.as_ref().and_then(|v| {
+                            crate::domain::vulnerability::value_objects::Version::parse(v).ok()
+                        });
+                        crate::domain::vulnerability::value_objects::VersionRange::new(
+                            start, end, true, false,
+                        )
+                    })
+                    .collect();
 
-        debug!(
-            "Cache miss for vulnerability: {}, querying repository",
-            vulnerability_id.as_str()
-        );
+            let fixed_versions: Vec<crate::domain::vulnerability::value_objects::Version> = aff
+                .ranges
+                .iter()
+                .flat_map(|r| {
+                    r.events.iter().filter_map(|e| {
+                        if let vulnera_advisor::Event::Fixed(v) = e {
+                            crate::domain::vulnerability::value_objects::Version::parse(v).ok()
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
 
-        // Query repository
-        let Some(vuln_repo) = &self.vulnerability_repository else {
-            return Err(ApplicationError::NotFound {
-                resource: "vulnerability".to_string(),
-                id: vulnerability_id.as_str().to_string(),
-            });
-        };
-        let vulnerability = vuln_repo
-            .get_vulnerability_by_id(vulnerability_id)
-            .await?
-            .ok_or_else(|| ApplicationError::NotFound {
-                resource: "vulnerability".to_string(),
-                id: vulnerability_id.as_str().to_string(),
-            })?;
+            crate::domain::vulnerability::entities::AffectedPackage::new(
+                pkg,
+                vulnerable_ranges,
+                fixed_versions,
+            )
+        })
+        .collect();
 
-        // Cache for 24 hours
-        let cache_ttl = std::time::Duration::from_secs(24 * 60 * 60);
-        if let Err(e) = self
-            .cache_service
-            .set(&cache_key, &vulnerability, cache_ttl)
-            .await
-        {
-            warn!(
-                "Failed to cache vulnerability {}: {}",
-                vulnerability_id.as_str(),
-                e
-            );
-        }
+    let sources = advisory
+        .aliases
+        .as_ref()
+        .map(|a| {
+            a.iter()
+                .map(|alias| {
+                    if alias.starts_with("GHSA-") {
+                        crate::domain::vulnerability::value_objects::VulnerabilitySource::GHSA
+                    } else if alias.starts_with("CVE-") {
+                        crate::domain::vulnerability::value_objects::VulnerabilitySource::NVD
+                    } else {
+                        crate::domain::vulnerability::value_objects::VulnerabilitySource::OSV
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            vec![crate::domain::vulnerability::value_objects::VulnerabilitySource::OSV]
+        });
 
-        Ok(vulnerability)
-    }
-}
+    let new_vuln = crate::domain::vulnerability::entities::NewVulnerability {
+        id,
+        summary: advisory.summary.unwrap_or_default(),
+        description: advisory.details.unwrap_or_default(),
+        severity,
+        affected_packages,
+        references: advisory.references.iter().map(|r| r.url.clone()).collect(),
+        published_at: advisory.published.unwrap_or_else(chrono::Utc::now),
+        sources,
+    };
 
-/// Use case for listing vulnerabilities with pagination and filtering
-pub struct ListVulnerabilitiesUseCase {
-    popular_package_service: Arc<dyn PopularPackageService>,
-}
-
-impl ListVulnerabilitiesUseCase {
-    /// Create a new use case instance
-    pub fn new(popular_package_service: Arc<dyn PopularPackageService>) -> Self {
-        Self {
-            popular_package_service,
-        }
-    }
-
-    /// Execute the use case to list vulnerabilities
-    pub async fn execute(
-        &self,
-        page: u32,
-        per_page: u32,
-        ecosystem_filter: Option<&str>,
-        severity_filter: Option<&str>,
-    ) -> Result<PopularPackageVulnerabilityResult, ApplicationError> {
-        self.popular_package_service
-            .list_vulnerabilities(page, per_page, ecosystem_filter, severity_filter)
-            .await
-    }
+    new_vuln.build().ok()
 }

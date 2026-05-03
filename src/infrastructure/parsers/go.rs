@@ -1,12 +1,9 @@
 //! Go ecosystem parsers
 
-use super::traits::{PackageFileParser, ParseResult};
-use crate::application::errors::ParseError;
-use async_trait::async_trait;
-use vulnera_contract::domain::vulnerability::{
-    entities::Package,
-    value_objects::{Ecosystem, Version},
-};
+use super::traits::{FilePattern, PackageFileParser, ParseResult, SourceType};
+use super::version_extractor;
+use crate::domain::errors::ParseError;
+use crate::domain::vulnerability::{entities::Package, value_objects::Ecosystem};
 
 /// Parser for go.mod files
 pub struct GoModParser;
@@ -80,65 +77,25 @@ impl GoModParser {
         let module_path = parts[0];
         let version_str = parts[1];
 
-        // Clean version string
-        let clean_version = self.clean_go_version(version_str)?;
-
-        let version = Version::parse(&clean_version).map_err(|_| ParseError::Version {
-            version: version_str.to_string(),
-        })?;
+        let version = match version_extractor::go_locked(version_str)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
 
         let package = Package::new(module_path.to_string(), version, Ecosystem::Go)
             .map_err(|e| ParseError::MissingField { field: e })?;
 
         Ok(Some(package))
     }
-
-    /// Clean Go version string
-    fn clean_go_version(&self, version_str: &str) -> Result<String, ParseError> {
-        let version_str = version_str.trim();
-
-        if version_str.is_empty() {
-            return Ok("0.0.0".to_string());
-        }
-
-        // Remove 'v' prefix if present
-        let cleaned = if let Some(stripped) = version_str.strip_prefix('v') {
-            stripped
-        } else {
-            version_str
-        };
-
-        // Handle pseudo-versions (e.g., v0.0.0-20210101000000-abcdef123456)
-        if let Some(dash_pos) = cleaned.find('-') {
-            let base_version = &cleaned[..dash_pos];
-            // If it's a pseudo-version, use the base version
-            if base_version.matches('.').count() >= 2 {
-                return Ok(base_version.to_string());
-            }
-        }
-
-        // Handle +incompatible suffix
-        let cleaned = if let Some(stripped) = cleaned.strip_suffix("+incompatible") {
-            stripped
-        } else {
-            cleaned
-        };
-
-        Ok(cleaned.to_string())
-    }
 }
 
-#[async_trait]
 impl PackageFileParser for GoModParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        filename == "go.mod"
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         let packages = self.parse_go_mod(content)?;
         Ok(ParseResult {
             packages,
             dependencies: Vec::new(),
+            source_type: SourceType::Manifest,
         })
     }
 
@@ -146,8 +103,8 @@ impl PackageFileParser for GoModParser {
         Ecosystem::Go
     }
 
-    fn priority(&self) -> u8 {
-        10 // High priority for go.mod
+    fn patterns(&self) -> &[FilePattern] {
+        &[FilePattern::Name("go.mod")]
     }
 }
 
@@ -196,12 +153,10 @@ impl GoSumParser {
                 }
                 seen_modules.insert(module_key);
 
-                // Clean version string
-                let clean_version = self.clean_go_sum_version(version_str)?;
-
-                let version = Version::parse(&clean_version).map_err(|_| ParseError::Version {
-                    version: version_str.to_string(),
-                })?;
+                let version = match version_extractor::go_locked(version_str)? {
+                    Some(v) => v,
+                    None => continue,
+                };
 
                 let package = Package::new(module_path.to_string(), version, Ecosystem::Go)
                     .map_err(|e| ParseError::MissingField { field: e })?;
@@ -212,52 +167,15 @@ impl GoSumParser {
 
         Ok(packages)
     }
-
-    /// Clean Go version string from go.sum
-    fn clean_go_sum_version(&self, version_str: &str) -> Result<String, ParseError> {
-        let version_str = version_str.trim();
-
-        if version_str.is_empty() {
-            return Ok("0.0.0".to_string());
-        }
-
-        // Remove 'v' prefix if present
-        let cleaned = if let Some(stripped) = version_str.strip_prefix('v') {
-            stripped
-        } else {
-            version_str
-        };
-
-        // Handle pseudo-versions
-        if let Some(dash_pos) = cleaned.find('-') {
-            let base_version = &cleaned[..dash_pos];
-            if base_version.matches('.').count() >= 2 {
-                return Ok(base_version.to_string());
-            }
-        }
-
-        // Handle +incompatible suffix
-        let cleaned = if let Some(stripped) = cleaned.strip_suffix("+incompatible") {
-            stripped
-        } else {
-            cleaned
-        };
-
-        Ok(cleaned.to_string())
-    }
 }
 
-#[async_trait]
 impl PackageFileParser for GoSumParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        filename == "go.sum"
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         let packages = self.parse_go_sum(content)?;
         Ok(ParseResult {
             packages,
             dependencies: Vec::new(),
+            source_type: SourceType::LockFile,
         })
     }
 
@@ -265,17 +183,18 @@ impl PackageFileParser for GoSumParser {
         Ecosystem::Go
     }
 
-    fn priority(&self) -> u8 {
-        12 // Higher priority than go.mod for exact versions
+    fn patterns(&self) -> &[FilePattern] {
+        &[FilePattern::Name("go.sum")]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::vulnerability::value_objects::Version;
 
-    #[tokio::test]
-    async fn test_go_mod_parser() {
+    #[test]
+    fn test_go_mod_parser() {
         let parser = GoModParser::new();
         let content = r#"
 module example.com/myproject
@@ -294,7 +213,7 @@ require (
 )
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 5);
 
         let gin_pkg = result
@@ -313,8 +232,8 @@ require (
         assert_eq!(crypto_pkg.version, Version::parse("0.0.0").unwrap());
     }
 
-    #[tokio::test]
-    async fn test_go_sum_parser() {
+    #[test]
+    fn test_go_sum_parser() {
         let parser = GoSumParser::new();
         let content = r#"
 github.com/gin-gonic/gin v1.8.1 h1:4+fr/el88TOO3ewCmQr8cx/CtZ/umlIRIs5M4NTNjf8=
@@ -323,7 +242,7 @@ github.com/stretchr/testify v1.7.1 h1:5TQK59W5E3v0r2duFAb7P95B6hEeOyEnHRa8MjYSMT
 github.com/stretchr/testify v1.7.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 2); // Should skip /go.mod entries
 
         let gin_pkg = result
@@ -335,32 +254,41 @@ github.com/stretchr/testify v1.7.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/
     }
 
     #[test]
-    fn test_clean_go_version() {
+    fn test_go_mod_inline_require() {
         let parser = GoModParser::new();
+        let content = r#"
+module example.com/myapp
 
-        assert_eq!(parser.clean_go_version("v1.8.1").unwrap(), "1.8.1");
-        assert_eq!(parser.clean_go_version("1.8.1").unwrap(), "1.8.1");
-        assert_eq!(
-            parser
-                .clean_go_version("v0.0.0-20220622213112-05595931fe9d")
-                .unwrap(),
-            "0.0.0"
-        );
-        assert_eq!(
-            parser.clean_go_version("v2.0.0+incompatible").unwrap(),
-            "2.0.0"
-        );
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.1
+require github.com/stretchr/testify v1.8.4
+        "#;
+
+        let result = parser.parse(content).unwrap();
+        assert_eq!(result.packages.len(), 2);
+
+        let gin_pkg = result
+            .packages
+            .iter()
+            .find(|p| p.name == "github.com/gin-gonic/gin")
+            .unwrap();
+        assert_eq!(gin_pkg.version, Version::parse("1.9.1").unwrap());
+
+        let testify_pkg = result
+            .packages
+            .iter()
+            .find(|p| p.name == "github.com/stretchr/testify")
+            .unwrap();
+        assert_eq!(testify_pkg.version, Version::parse("1.8.4").unwrap());
     }
 
     #[test]
-    fn test_parser_supports_file() {
+    fn test_parser_patterns() {
         let mod_parser = GoModParser::new();
         let sum_parser = GoSumParser::new();
 
-        assert!(mod_parser.supports_file("go.mod"));
-        assert!(!mod_parser.supports_file("go.sum"));
-
-        assert!(sum_parser.supports_file("go.sum"));
-        assert!(!sum_parser.supports_file("go.mod"));
+        assert_eq!(mod_parser.patterns(), &[FilePattern::Name("go.mod")]);
+        assert_eq!(sum_parser.patterns(), &[FilePattern::Name("go.sum")]);
     }
 }

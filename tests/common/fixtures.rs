@@ -1,6 +1,6 @@
 //! Test data fixtures for vulnera-deps
 
-use vulnera_contract::domain::vulnerability::{
+use vulnera_deps::domain::vulnerability::{
     entities::Package,
     value_objects::{Ecosystem, Version},
 };
@@ -12,6 +12,7 @@ pub fn test_package(name: impl Into<String>, version: impl Into<String>) -> Pack
         Version::parse(&version.into()).expect("Invalid version"),
         Ecosystem::Npm,
     )
+    .expect("Package creation should succeed")
 }
 
 /// Sample dependency graph data
@@ -30,4 +31,3 @@ pub fn sample_dependency_graph() -> Vec<(String, String, Vec<String>)> {
         ),
     ]
 }
-

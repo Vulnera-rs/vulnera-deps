@@ -3,14 +3,14 @@
 //! UV is a fast Python package manager that uses pyproject.toml and uv.lock files.
 //! This module provides parsers for UV's lockfile format.
 
-use super::traits::{PackageFileParser, ParseResult};
-use crate::application::errors::ParseError;
-use async_trait::async_trait;
-use std::collections::HashMap;
-use vulnera_contract::domain::vulnerability::{
+use super::traits::{FilePattern, PackageFileParser, ParseResult, SourceType};
+use super::version_extractor;
+use crate::domain::errors::ParseError;
+use crate::domain::vulnerability::{
     entities::{Dependency, Package},
-    value_objects::{Ecosystem, Version},
+    value_objects::Ecosystem,
 };
+use std::collections::HashMap;
 
 /// Parser for uv.lock files
 ///
@@ -61,12 +61,11 @@ impl UvLockParser {
                     }
                     seen_packages.insert(package_key);
 
-                    // Clean version string (remove 'v' prefix if present)
-                    let clean_version = self.clean_uv_version(version_str)?;
-
                     let version =
-                        Version::parse(&clean_version).map_err(|_| ParseError::Version {
-                            version: version_str.to_string(),
+                        version_extractor::python_locked(version_str)?.ok_or_else(|| {
+                            ParseError::Version {
+                                version: version_str.to_string(),
+                            }
                         })?;
 
                     let package = Package::new(name.to_string(), version, Ecosystem::PyPI)
@@ -82,11 +81,7 @@ impl UvLockParser {
                                 // dep_str is like "certifi>=2021" or "charset-normalizer<4,>=2"
                                 // We need to split name and requirement
                                 let (dep_name, dep_req) = self.parse_dependency_string(dep_str);
-                                pending_dependencies.push((
-                                    package.clone(),
-                                    dep_name.to_string(),
-                                    dep_req.to_string(),
-                                ));
+                                pending_dependencies.push((package.clone(), dep_name, dep_req));
                             }
                         }
                     }
@@ -115,51 +110,28 @@ impl UvLockParser {
         Ok(ParseResult {
             packages,
             dependencies,
+            source_type: SourceType::LockFile,
         })
     }
 
-    /// Parse dependency string into (name, requirement)
-    fn parse_dependency_string<'a>(&self, dep_str: &'a str) -> (&'a str, &'a str) {
-        // Find the first character that indicates a version requirement
+    fn parse_dependency_string(&self, dep_str: &str) -> (String, String) {
         let split_chars = ['<', '>', '=', '!', '~'];
         if let Some(idx) = dep_str.find(&split_chars[..]) {
-            (&dep_str[..idx], &dep_str[idx..])
+            let name = &dep_str[..idx];
+            let req = &dep_str[idx..];
+            let display = match version_extractor::python(req) {
+                Ok(Some((cleaned, _))) => cleaned,
+                _ => req.to_string(),
+            };
+            (name.to_string(), display)
         } else {
-            // No requirement specified, or it's just a name
-            (dep_str, "*")
+            (dep_str.to_string(), "*".to_string())
         }
-    }
-
-    /// Clean UV version string
-    fn clean_uv_version(&self, version_str: &str) -> Result<String, ParseError> {
-        let version_str = version_str.trim();
-
-        if version_str.is_empty() {
-            return Ok("0.0.0".to_string());
-        }
-
-        // Remove 'v' prefix if present (UV sometimes includes it)
-        let cleaned = if let Some(stripped) = version_str.strip_prefix('v') {
-            stripped
-        } else {
-            version_str
-        };
-
-        // Handle pre-release versions and build metadata
-        // UV versions are typically PEP 440 compliant, but we normalize to semver
-        let cleaned = cleaned.trim();
-
-        Ok(cleaned.to_string())
     }
 }
 
-#[async_trait]
 impl PackageFileParser for UvLockParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        filename == "uv.lock"
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         let toml_value: toml::Value = toml::from_str(content)?;
         self.extract_lock_data(&toml_value)
     }
@@ -168,17 +140,18 @@ impl PackageFileParser for UvLockParser {
         Ecosystem::PyPI
     }
 
-    fn priority(&self) -> u8 {
-        20 // High priority for lockfiles (exact versions)
+    fn patterns(&self) -> &[FilePattern] {
+        &[FilePattern::Name("uv.lock")]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::vulnerability::value_objects::Version;
 
-    #[tokio::test]
-    async fn test_uv_lock_parser() {
+    #[test]
+    fn test_uv_lock_parser() {
         let parser = UvLockParser::new();
         let content = r#"
 version = 1
@@ -203,7 +176,8 @@ version = "3.2.0"
 source = { type = "registry", url = "https://pypi.org/simple" }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
+        assert_eq!(result.source_type, SourceType::LockFile);
         assert_eq!(result.packages.len(), 3);
 
         let requests_pkg = result
@@ -229,11 +203,11 @@ source = { type = "registry", url = "https://pypi.org/simple" }
             .find(|d| d.to.name == "certifi")
             .unwrap();
         assert_eq!(dep1.from.name, "requests");
-        assert_eq!(dep1.requirement, ">=2021");
+        assert_eq!(dep1.requirement, "2021.0.0");
     }
 
-    #[tokio::test]
-    async fn test_uv_lock_parser_with_v_prefix() {
+    #[test]
+    fn test_uv_lock_parser_with_v_prefix() {
         let parser = UvLockParser::new();
         let content = r#"
 version = 1
@@ -244,7 +218,7 @@ version = "v2.31.0"
 source = { type = "registry", url = "https://pypi.org/simple" }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 1);
 
         let requests_pkg = result
@@ -255,8 +229,8 @@ source = { type = "registry", url = "https://pypi.org/simple" }
         assert_eq!(requests_pkg.version, Version::parse("2.31.0").unwrap());
     }
 
-    #[tokio::test]
-    async fn test_uv_lock_parser_deduplication() {
+    #[test]
+    fn test_uv_lock_parser_deduplication() {
         let parser = UvLockParser::new();
         let content = r#"
 version = 1
@@ -272,26 +246,16 @@ version = "2.31.0"
 source = { type = "registry", url = "https://pypi.org/simple" }
         "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         // Should deduplicate identical packages
         assert_eq!(result.packages.len(), 1);
     }
 
     #[test]
-    fn test_clean_uv_version() {
+    fn test_parser_patterns() {
         let parser = UvLockParser::new();
-
-        assert_eq!(parser.clean_uv_version("2.31.0").unwrap(), "2.31.0");
-        assert_eq!(parser.clean_uv_version("v2.31.0").unwrap(), "2.31.0");
-        assert_eq!(parser.clean_uv_version("2023.7.22").unwrap(), "2023.7.22");
-    }
-
-    #[test]
-    fn test_parser_supports_file() {
-        let parser = UvLockParser::new();
-
-        assert!(parser.supports_file("uv.lock"));
-        assert!(!parser.supports_file("pyproject.toml"));
-        assert!(!parser.supports_file("requirements.txt"));
+        let patterns = parser.patterns();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0], FilePattern::Name("uv.lock"));
     }
 }

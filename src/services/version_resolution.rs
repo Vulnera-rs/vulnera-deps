@@ -5,13 +5,14 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::application::errors::ApplicationError;
-use vulnera_contract::domain::vulnerability::entities::Vulnerability;
-use vulnera_contract::domain::vulnerability::value_objects::{Ecosystem, Version};
-use vulnera_contract::application::vulnerability::services::CacheService;
-use vulnera_contract::infrastructure::registries::PackageRegistryClient;
+use crate::domain::vulnerability::entities::Vulnerability;
+use crate::domain::vulnerability::value_objects::{Ecosystem, Version};
+use crate::infrastructure::registries::PackageRegistryClient;
+use crate::services::cache::{CacheBackendAdapter, CacheService};
 
 use crate::types::{VersionRecommendation, VersionResolutionService, compute_upgrade_impact};
 
@@ -53,34 +54,47 @@ use crate::types::{VersionRecommendation, VersionResolutionService, compute_upgr
 /// - Registry queries typically 100-500ms (depends on ecosystem)
 /// - Parallel version fetching for multiple packages
 /// - Memory-efficient streaming for large version lists
-pub struct VersionResolutionServiceImpl<R>
+pub struct VersionResolutionServiceImpl<R, C = CacheBackendAdapter>
 where
     R: PackageRegistryClient,
+    C: CacheService,
 {
     registry: Arc<R>,
-    cache_service: Option<Arc<vulnera_contract::infrastructure::cache::CacheServiceImpl>>,
+    cache_service: Option<Arc<C>>,
     registry_versions_ttl: Duration,
     /// When true, exclude prerelease versions from recommendations
-    exclude_prereleases: bool,
+    exclude_prereleases: AtomicBool,
+}
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            let lower = v.to_lowercase();
+            matches!(lower.as_str(), "TRUE")
+        })
+        .unwrap_or(default)
 }
 
-impl<R> VersionResolutionServiceImpl<R>
+/// Parse a u64 environment variable with a default.
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+impl<R, C> VersionResolutionServiceImpl<R, C>
 where
     R: PackageRegistryClient,
+    C: CacheService,
 {
     pub fn new(registry: Arc<R>) -> Self {
-        // TTL follows backend cache config: VULNERA__CACHE__TTL_HOURS (default 24)
-        let ttl_hours = std::env::var("VULNERA__CACHE__TTL_HOURS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(24);
+        let ttl_hours = env_u64("VULNERA__CACHE__TTL_HOURS", 24);
         let registry_versions_ttl = Duration::from_secs(ttl_hours * 3600);
-
-        // Prerelease exclusion follows env: VULNERA__RECOMMENDATIONS__EXCLUDE_PRERELEASES
-        let exclude_prereleases = std::env::var("VULNERA__RECOMMENDATIONS__EXCLUDE_PRERELEASES")
-            .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
-            .unwrap_or(false);
+        let exclude_prereleases = AtomicBool::new(env_bool(
+            "VULNERA__RECOMMENDATIONS__EXCLUDE_PRERELEASES",
+            false,
+        ));
 
         Self {
             registry,
@@ -90,22 +104,13 @@ where
         }
     }
 
-    pub fn new_with_cache(
-        registry: Arc<R>,
-        cache_service: Arc<vulnera_contract::infrastructure::cache::CacheServiceImpl>,
-    ) -> Self {
-        // TTL follows backend cache config: VULNERA__CACHE__TTL_HOURS (default 24)
-        let ttl_hours = std::env::var("VULNERA__CACHE__TTL_HOURS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(24);
+    pub fn new_with_cache(registry: Arc<R>, cache_service: Arc<C>) -> Self {
+        let ttl_hours = env_u64("VULNERA__CACHE__TTL_HOURS", 24);
         let registry_versions_ttl = Duration::from_secs(ttl_hours * 3600);
-
-        // Prerelease exclusion follows env: VULNERA__RECOMMENDATIONS__EXCLUDE_PRERELEASES
-        let exclude_prereleases = std::env::var("VULNERA__RECOMMENDATIONS__EXCLUDE_PRERELEASES")
-            .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
-            .unwrap_or(false);
+        let exclude_prereleases = AtomicBool::new(env_bool(
+            "VULNERA__RECOMMENDATIONS__EXCLUDE_PRERELEASES",
+            false,
+        ));
 
         Self {
             registry,
@@ -116,15 +121,16 @@ where
     }
 
     /// Set whether to exclude prerelease versions from recommendations at runtime.
-    pub fn set_exclude_prereleases(&mut self, exclude: bool) {
-        self.exclude_prereleases = exclude;
+    pub fn set_exclude_prereleases(&self, exclude: bool) {
+        self.exclude_prereleases.store(exclude, Ordering::Relaxed);
     }
 }
 
 #[async_trait]
-impl<R> VersionResolutionService for VersionResolutionServiceImpl<R>
+impl<R, C> VersionResolutionService for VersionResolutionServiceImpl<R, C>
 where
     R: PackageRegistryClient + 'static,
+    C: CacheService + 'static,
 {
     #[tracing::instrument(skip(self, name, current, vulnerabilities))]
     async fn recommend(
@@ -136,14 +142,9 @@ where
     ) -> Result<VersionRecommendation, ApplicationError> {
         // Fetch available versions from registry with optional cache
         let versions_res = if let Some(cache) = &self.cache_service {
-            let cache_key =
-                vulnera_contract::infrastructure::cache::CacheServiceImpl::registry_versions_key(
-                    &ecosystem, name,
-                );
+            let cache_key = crate::services::cache::registry_versions_key(&ecosystem, name);
             match cache
-                .get::<Vec<vulnera_contract::infrastructure::registries::VersionInfo>>(
-                    &cache_key,
-                )
+                .get::<Vec<crate::infrastructure::registries::VersionInfo>>(&cache_key)
                 .await
             {
                 Ok(Some(cached)) => {
@@ -177,7 +178,7 @@ where
             vulnerabilities.iter().any(|vv| {
                 vv.affected_packages.iter().any(|ap| {
                     // Build a package for matching name/ecosystem, with candidate version
-                    if let Ok(pkg) = vulnera_contract::domain::vulnerability::entities::Package::new(
+                    if let Ok(pkg) = crate::domain::vulnerability::entities::Package::new(
                         name.to_string(),
                         v.clone(),
                         ecosystem.clone(),
@@ -242,7 +243,7 @@ where
                 }),
                 nearest_impact,
                 most_up_to_date_impact: None,
-                prerelease_exclusion_applied: self.exclude_prereleases,
+                prerelease_exclusion_applied: self.exclude_prereleases.load(Ordering::Relaxed),
                 notes,
             });
         }
@@ -265,9 +266,9 @@ where
 
         // Build safe sets - pre-allocate with estimated capacity
         let estimated_safe_capacity = (versions.len() * 7) / 10; // 70% estimate
-        let mut safe_all: Vec<&vulnera_contract::infrastructure::registries::VersionInfo> =
+        let mut safe_all: Vec<&crate::infrastructure::registries::VersionInfo> =
             Vec::with_capacity(estimated_safe_capacity);
-        let mut safe_stable: Vec<&vulnera_contract::infrastructure::registries::VersionInfo> =
+        let mut safe_stable: Vec<&crate::infrastructure::registries::VersionInfo> =
             Vec::with_capacity(estimated_safe_capacity);
         for vi in &versions {
             if !is_vulnerable(&vi.version) {
@@ -278,10 +279,12 @@ where
             }
         }
 
+        let exclude_prereleases = self.exclude_prereleases.load(Ordering::Relaxed);
+
         // most_up_to_date_safe:
         // - if exclude_prereleases: only consider stable
         // - otherwise prefer stable, fall back to prerelease with note
-        let most_up_to_date_safe = if self.exclude_prereleases {
+        let most_up_to_date_safe = if exclude_prereleases {
             if let Some(last) = safe_stable.last() {
                 Some(last.version.clone())
             } else {
@@ -307,7 +310,7 @@ where
         // - if exclude_prereleases: consider only stable candidates
         // - otherwise prefer stable, then prerelease with note
         let nearest_safe_above_current = current.as_ref().and_then(|cur| {
-            if self.exclude_prereleases {
+            if exclude_prereleases {
                 let stable_candidate = safe_stable.iter().find(|vi| vi.version >= *cur);
                 return stable_candidate.map(|c| c.version.clone());
             }
@@ -337,7 +340,7 @@ where
             nearest_safe_above_current,
             most_up_to_date_safe,
             next_safe_minor_within_current_major: current.as_ref().and_then(|cur| {
-                if self.exclude_prereleases {
+                if exclude_prereleases {
                     safe_stable
                         .iter()
                         .find(|vi| vi.version >= *cur && vi.version.0.major == cur.0.major)
@@ -356,7 +359,7 @@ where
             }),
             nearest_impact,
             most_up_to_date_impact,
-            prerelease_exclusion_applied: self.exclude_prereleases,
+            prerelease_exclusion_applied: exclude_prereleases,
             notes,
         })
     }

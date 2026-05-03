@@ -1,69 +1,12 @@
-use super::traits::{PackageFileParser, ParseResult};
-use crate::application::errors::ParseError;
-use async_trait::async_trait;
-use once_cell::sync::Lazy;
-use quick_xml::Reader;
-use quick_xml::events::Event;
-use regex::Regex;
-use vulnera_contract::domain::vulnerability::{
+use super::traits::{FilePattern, PackageFileParser, ParseResult, SourceType};
+use super::version_extractor;
+use crate::domain::errors::ParseError;
+use crate::domain::vulnerability::{
     entities::Package,
     value_objects::{Ecosystem, Version},
 };
-
-static RE_NUGET_VERSION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\b(\d+(?:\.\d+){0,3}(?:-[0-9A-Za-z\.-]+)?)\b").unwrap());
-
-/// Best-effort cleaning of NuGet version strings:
-/// - Extracts the first numeric dotted version (1 to 4 segments), optionally keeps a simple pre-release suffix
-/// - If a range is provided (e.g., "[1.2.3, 2.0.0)"), it picks the first version in the string (usually the lower bound)
-/// - On failure or unresolved property-like values (e.g., "$(SomeVar)"), returns "0.0.0"
-fn clean_nuget_version(input: &str) -> String {
-    let s = input.trim();
-    if s.is_empty() || s.contains("$(") {
-        return "0.0.0".to_string();
-    }
-    // Capture numeric dotted version with optional simple pre-release (e.g., -rc1)
-    // Accept up to 4 numeric segments because NuGet sometimes uses 4-part versions (e.g., 4.2.11.1)
-    // Semver crate may not accept 4 segments, so fall back by truncating to 3 segments if needed later.
-    if let Some(caps) = RE_NUGET_VERSION.captures(s) {
-        return caps.get(1).unwrap().as_str().to_string();
-    }
-    "0.0.0".to_string()
-}
-
-/// NuGet allows 4-segment versions, but semver::Version is 3 segments.
-/// If parsing fails and we have 4 segments, try truncating to 3.
-fn parse_version_lenient(v: &str) -> Result<Version, ParseError> {
-    match Version::parse(v) {
-        Ok(ver) => Ok(ver),
-        Err(_) => {
-            // Try truncating to first 3 numeric segments if 4 present
-            let parts: Vec<&str> = v.split('-').collect(); // split prerelease from core
-            let core = parts[0];
-            let prerelease = if parts.len() > 1 {
-                Some(parts[1])
-            } else {
-                None
-            };
-
-            let nums: Vec<&str> = core.split('.').collect();
-            if nums.len() > 3 {
-                let truncated = format!("{}.{}.{}", nums[0], nums[1], nums[2]);
-                let with_pre = match prerelease {
-                    Some(pre) if !pre.is_empty() => format!("{}-{}", truncated, pre),
-                    _ => truncated,
-                };
-                Version::parse(&with_pre).map_err(|_| ParseError::Version {
-                    version: v.to_string(),
-                })
-            } else {
-                Err(ParseError::Version {
-                    version: v.to_string(),
-                })
-            }
-        }
-    }
-}
+use quick_xml::Reader;
+use quick_xml::events::Event;
 
 /// Parser for legacy NuGet packages.config files.
 /// Example:
@@ -118,19 +61,18 @@ impl NuGetPackagesConfigParser {
                         }
 
                         if let Some(pkg_name) = id {
-                            let raw_ver = version.unwrap_or_else(|| "0.0.0".to_string());
-                            let cleaned = clean_nuget_version(&raw_ver);
-                            let ver = parse_version_lenient(&cleaned)?;
+                            let ver = match version {
+                                Some(raw_ver) => match version_extractor::nuget_locked(&raw_ver)? {
+                                    Some(v) => v,
+                                    None => continue,
+                                },
+                                None => Version::new(0, 0, 0),
+                            };
 
                             let pkg = Package::new(pkg_name, ver, Ecosystem::NuGet)
                                 .map_err(|e| ParseError::MissingField { field: e })?;
                             packages.push(pkg);
                         }
-                    }
-
-                    // If this is an Empty element, no End event will follow; we just continue
-                    if matches!(e, quick_xml::events::BytesStart { .. }) {
-                        // Start event handled above
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -148,17 +90,13 @@ impl NuGetPackagesConfigParser {
     }
 }
 
-#[async_trait]
 impl PackageFileParser for NuGetPackagesConfigParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        filename.eq_ignore_ascii_case("packages.config")
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         let packages = self.parse_packages_config(content)?;
         Ok(ParseResult {
             packages,
             dependencies: Vec::new(),
+            source_type: SourceType::LockFile,
         })
     }
 
@@ -166,8 +104,8 @@ impl PackageFileParser for NuGetPackagesConfigParser {
         Ecosystem::NuGet
     }
 
-    fn priority(&self) -> u8 {
-        18 // Prefer over project files; resolved versions are more precise
+    fn patterns(&self) -> &[FilePattern] {
+        &[FilePattern::Name("packages.config")]
     }
 }
 
@@ -223,9 +161,37 @@ impl NuGetProjectXmlParser {
 
                             match key.as_str() {
                                 "Include" => current_name = Some(val),
-                                "Version" => current_version = Some(val),
+                                "Version" if current_version.is_none() => {
+                                    current_version = Some(val)
+                                }
+                                "VersionOverride" => current_version = Some(val),
                                 _ => {}
                             }
+                        }
+                    } else if tag.eq_ignore_ascii_case("PackageVersion") {
+                        let mut name: Option<String> = None;
+                        let mut ver: Option<String> = None;
+                        for attr in e.attributes().flatten() {
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let val = reader
+                                .decoder()
+                                .decode(&attr.value)
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                            match key.as_str() {
+                                "Include" => name = Some(val),
+                                "Version" => ver = Some(val),
+                                _ => {}
+                            }
+                        }
+                        if let Some(pkg_name) = name
+                            && let Some(raw_ver) = ver
+                            && let Some(v) = version_extractor::nuget_locked(&raw_ver)?
+                        {
+                            let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
+                                .map_err(|e| ParseError::MissingField { field: e })?;
+                            packages.push(pkg);
                         }
                     } else if in_package_ref && tag.eq_ignore_ascii_case("Version") {
                         in_version_child = true;
@@ -248,17 +214,42 @@ impl NuGetProjectXmlParser {
                                 .to_string();
                             match key.as_str() {
                                 "Include" => name_attr = Some(val),
-                                "Version" => version_attr = Some(val),
+                                "Version" if version_attr.is_none() => version_attr = Some(val),
+                                "VersionOverride" => version_attr = Some(val),
                                 _ => {}
                             }
                         }
 
-                        if let Some(pkg_name) = name_attr {
-                            let raw_ver = version_attr.unwrap_or_else(|| "0.0.0".to_string());
-                            let cleaned = clean_nuget_version(&raw_ver);
-                            let ver = parse_version_lenient(&cleaned)?;
-
-                            let pkg = Package::new(pkg_name, ver, Ecosystem::NuGet)
+                        if let Some(pkg_name) = name_attr
+                            && let Some(raw_ver) = version_attr
+                            && let Some(v) = version_extractor::nuget_locked(&raw_ver)?
+                        {
+                            let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
+                                .map_err(|e| ParseError::MissingField { field: e })?;
+                            packages.push(pkg);
+                        }
+                    } else if tag.eq_ignore_ascii_case("PackageVersion") {
+                        let mut name_attr: Option<String> = None;
+                        let mut version_attr: Option<String> = None;
+                        for attr in e.attributes().flatten() {
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let val = reader
+                                .decoder()
+                                .decode(&attr.value)
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                            match key.as_str() {
+                                "Include" => name_attr = Some(val),
+                                "Version" => version_attr = Some(val),
+                                _ => {}
+                            }
+                        }
+                        if let Some(pkg_name) = name_attr
+                            && let Some(raw_ver) = version_attr
+                            && let Some(v) = version_extractor::nuget_locked(&raw_ver)?
+                        {
+                            let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
                                 .map_err(|e| ParseError::MissingField { field: e })?;
                             packages.push(pkg);
                         }
@@ -282,14 +273,11 @@ impl NuGetProjectXmlParser {
                         in_version_child = false;
                     } else if tag.eq_ignore_ascii_case("PackageReference") && in_package_ref {
                         // Finalize this package ref
-                        if let Some(pkg_name) = current_name.take() {
-                            let raw_ver = current_version
-                                .take()
-                                .unwrap_or_else(|| "0.0.0".to_string());
-                            let cleaned = clean_nuget_version(&raw_ver);
-                            let ver = parse_version_lenient(&cleaned)?;
-
-                            let pkg = Package::new(pkg_name, ver, Ecosystem::NuGet)
+                        if let Some(pkg_name) = current_name.take()
+                            && let Some(raw_ver) = current_version.take()
+                            && let Some(v) = version_extractor::nuget_locked(&raw_ver)?
+                        {
+                            let pkg = Package::new(pkg_name, v, Ecosystem::NuGet)
                                 .map_err(|e| ParseError::MissingField { field: e })?;
                             packages.push(pkg);
                         }
@@ -312,18 +300,13 @@ impl NuGetProjectXmlParser {
     }
 }
 
-#[async_trait]
 impl PackageFileParser for NuGetProjectXmlParser {
-    fn supports_file(&self, filename: &str) -> bool {
-        let f = filename.to_ascii_lowercase();
-        f.ends_with(".csproj") || f.ends_with(".fsproj") || f.ends_with(".vbproj")
-    }
-
-    async fn parse_file(&self, content: &str) -> Result<ParseResult, ParseError> {
+    fn parse(&self, content: &str) -> Result<ParseResult, ParseError> {
         let packages = self.parse_project_xml(content)?;
         Ok(ParseResult {
             packages,
             dependencies: Vec::new(),
+            source_type: SourceType::Manifest,
         })
     }
 
@@ -331,8 +314,12 @@ impl PackageFileParser for NuGetProjectXmlParser {
         Ecosystem::NuGet
     }
 
-    fn priority(&self) -> u8 {
-        8 // Lower than packages.config, higher than generic/legacy fallbacks
+    fn patterns(&self) -> &[FilePattern] {
+        &[
+            FilePattern::Extension("csproj"),
+            FilePattern::Extension("fsproj"),
+            FilePattern::Extension("vbproj"),
+        ]
     }
 }
 
@@ -340,8 +327,8 @@ impl PackageFileParser for NuGetProjectXmlParser {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_packages_config_parser() {
+    #[test]
+    fn test_packages_config_parser() {
         let parser = NuGetPackagesConfigParser::new();
         let content = r#"
 <?xml version="1.0" encoding="utf-8"?>
@@ -352,7 +339,7 @@ mod tests {
 </packages>
 "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 3);
 
         let nj = result
@@ -377,8 +364,8 @@ mod tests {
         assert_eq!(nov.version, Version::parse("0.0.0").unwrap());
     }
 
-    #[tokio::test]
-    async fn test_project_xml_parser() {
+    #[test]
+    fn test_project_xml_parser() {
         let parser = NuGetProjectXmlParser::new();
         let content = r#"
 <Project Sdk="Microsoft.NET.Sdk">
@@ -392,7 +379,7 @@ mod tests {
 </Project>
 "#;
 
-        let result = parser.parse_file(content).await.unwrap();
+        let result = parser.parse(content).unwrap();
         assert_eq!(result.packages.len(), 3);
 
         let nj = result
@@ -418,11 +405,82 @@ mod tests {
     }
 
     #[test]
-    fn test_clean_nuget_version() {
-        assert_eq!(clean_nuget_version("13.0.1"), "13.0.1");
-        assert_eq!(clean_nuget_version("[2.10.0,3.0.0)"), "2.10.0");
-        assert_eq!(clean_nuget_version("  1.2.3-rc1  "), "1.2.3-rc1");
-        assert_eq!(clean_nuget_version("$(SomeVar)"), "0.0.0");
-        assert_eq!(clean_nuget_version(""), "0.0.0");
+    fn test_packages_config_skips_property_ref() {
+        let parser = NuGetPackagesConfigParser::new();
+        let content = r#"
+<?xml version="1.0" encoding="utf-8"?>
+<packages>
+  <package id="ShouldBeSkipped" version="$(Version)" />
+  <package id="Normal" version="1.2.3" />
+</packages>
+"#;
+        let result = parser.parse(content).unwrap();
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(result.packages[0].name, "Normal");
+        assert_eq!(result.packages[0].version, Version::parse("1.2.3").unwrap());
+    }
+
+    #[test]
+    fn test_project_xml_cpm() {
+        let parser = NuGetProjectXmlParser::new();
+        let content = r#"
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="WithoutVersion" />
+    <PackageReference Include="WithVersionOverride" VersionOverride="2.0.0" />
+    <PackageReference Include="Normal" Version="1.0.0" />
+  </ItemGroup>
+</Project>
+"#;
+        let result = parser.parse(content).unwrap();
+        assert_eq!(result.packages.len(), 2);
+
+        let override_pkg = result
+            .packages
+            .iter()
+            .find(|p| p.name == "WithVersionOverride")
+            .unwrap();
+        assert_eq!(override_pkg.version, Version::parse("2.0.0").unwrap());
+
+        let normal = result.packages.iter().find(|p| p.name == "Normal").unwrap();
+        assert_eq!(normal.version, Version::parse("1.0.0").unwrap());
+    }
+
+    #[test]
+    fn test_project_xml_package_version() {
+        let parser = NuGetProjectXmlParser::new();
+        let content = r#"
+<Project>
+  <ItemGroup>
+    <PackageVersion Include="Newtonsoft.Json" Version="13.0.1" />
+  </ItemGroup>
+</Project>
+"#;
+        let result = parser.parse(content).unwrap();
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(result.packages[0].name, "Newtonsoft.Json");
+        assert_eq!(
+            result.packages[0].version,
+            Version::parse("13.0.1").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parser_patterns() {
+        let cfg_parser = NuGetPackagesConfigParser::new();
+        let proj_parser = NuGetProjectXmlParser::new();
+
+        assert_eq!(
+            cfg_parser.patterns(),
+            &[FilePattern::Name("packages.config")]
+        );
+        assert_eq!(
+            proj_parser.patterns(),
+            &[
+                FilePattern::Extension("csproj"),
+                FilePattern::Extension("fsproj"),
+                FilePattern::Extension("vbproj"),
+            ]
+        );
     }
 }

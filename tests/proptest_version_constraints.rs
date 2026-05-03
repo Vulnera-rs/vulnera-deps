@@ -1,6 +1,7 @@
 //! Property-based tests for version constraints
 
 use proptest::prelude::*;
+use vulnera_deps::domain::version_constraint::VersionConstraint;
 
 proptest! {
     #[test]
@@ -18,8 +19,8 @@ proptest! {
         ];
 
         for constraint in constraints {
-            // Just verify parsing doesn't crash
-            let _ = constraint;
+            prop_assert!(VersionConstraint::parse(&constraint).is_ok(),
+                "Failed to parse constraint: {}", constraint);
         }
     }
 }

@@ -7,8 +7,8 @@ use std::path::Path;
 use tokio::fs;
 use tracing::{debug, info};
 
-use crate::domain::DependencyGraph;
 use crate::application::errors::ApplicationError;
+use crate::domain::DependencyGraph;
 
 /// Exporter for dependency graphs supporting multiple formats
 pub struct GraphExporter;

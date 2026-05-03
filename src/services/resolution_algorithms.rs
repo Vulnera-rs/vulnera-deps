@@ -3,8 +3,8 @@
 //! This module provides advanced algorithms for dependency resolution,
 //! including constraint satisfaction and conflict resolution.
 
+use crate::domain::vulnerability::value_objects::Version;
 use std::collections::HashMap;
-use vulnera_contract::domain::vulnerability::value_objects::Version;
 
 use crate::domain::{DependencyGraph, PackageId, VersionConstraint};
 
@@ -192,6 +192,8 @@ impl BacktrackingResolver {
             return false;
         }
 
+        let conflict_snapshot = conflicts.len();
+
         for candidate in candidates {
             assignments.insert(package_id.clone(), candidate.clone());
 
@@ -208,6 +210,8 @@ impl BacktrackingResolver {
                 return true;
             }
 
+            // Restore conflicts to pre-branch state on backtrack
+            conflicts.truncate(conflict_snapshot);
             assignments.remove(package_id);
         }
 
@@ -332,9 +336,9 @@ impl LexicographicOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::vulnerability::entities::Package;
+    use crate::domain::vulnerability::value_objects::Ecosystem;
     use crate::domain::{DependencyEdge, DependencyGraph, PackageNode};
-    use vulnera_contract::domain::vulnerability::entities::Package;
-    use vulnera_contract::domain::vulnerability::value_objects::Ecosystem;
 
     fn test_package(name: &str, version: &str) -> Package {
         Package::new(
